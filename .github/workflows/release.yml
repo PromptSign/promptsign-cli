@@ -154,6 +154,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # A tag carrying a pre-release suffix (v0.2.0-rc.1) must not become
+          # the repo's "Latest" release: that is what download links and
+          # `gh release download` follow by default.
+          case "${{ github.ref_name }}" in
+            *-*) prerelease=--prerelease ;;
+            *)   prerelease= ;;
+          esac
           gh release create "${{ github.ref_name }}" dist/* \
             --title "${{ github.ref_name }}" \
-            --generate-notes
+            --generate-notes ${prerelease}

@@ -49,15 +49,21 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked --features local-key -- -D warnings
 
+  # Off by default: this job checks out PromptSign/spec and
+  # PromptSign/promptsign-node, and the automatic GITHUB_TOKEN only reads this
+  # repository — so while those two are private the checkouts fail with "Not
+  # Found". Set the repository variable RUN_CONFORMANCE=true once they are
+  # readable (either made public, or given a token here). Until then, run the
+  # suite locally; see the README's cross-implementation conformance section.
   conformance:
     name: cross-implementation conformance
+    if: ${{ vars.RUN_CONFORMANCE == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
           path: promptsign-cli
 
-      # The suite and the second implementation are public repos.
       - uses: actions/checkout@v7
         with:
           repository: PromptSign/spec
