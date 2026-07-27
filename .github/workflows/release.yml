@@ -33,6 +33,9 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             cross: true
+            # Cross-compiled on an x86_64 runner: the binary cannot be executed
+            # here, so packaging checks its architecture instead of running it.
+            foreign: true
           - os: macos-13
             target: x86_64-apple-darwin
           - os: macos-14
@@ -64,7 +67,15 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           bin="target/${{ matrix.target }}/release/promptsign"
-          "$bin" --version
+          # Smoke-test what we are about to ship. Running it is the stronger
+          # check, but a foreign-architecture build can only be inspected —
+          # which at least catches a binary built for the wrong target.
+          if [ "${{ matrix.foreign }}" = "true" ]; then
+            file -b "$bin"
+            file -b "$bin" | grep -q 'ARM aarch64'
+          else
+            "$bin" --version
+          fi
           mkdir -p dist
           tar -czf "dist/promptsign-${{ matrix.target }}.tar.gz" \
             -C "target/${{ matrix.target }}/release" promptsign
