@@ -91,12 +91,10 @@ pub fn cmd_proxy(rest: &[String]) -> ExitCode {
     eprintln!("  allowed upstreams: {}", hosts.join(", "));
     eprintln!("  point the web app at it: VITE_KEYLESS_PROXY_URL=http://{addr}");
 
-    for stream in listener.incoming() {
-        if let Ok(stream) = stream {
-            let cfg = cfg.clone();
+    for stream in listener.incoming().flatten() {
+        let cfg = cfg.clone();
 
-            std::thread::spawn(move || handle(stream, &cfg));
-        }
+        std::thread::spawn(move || handle(stream, &cfg));
     }
     ExitCode::SUCCESS
 }
@@ -108,7 +106,13 @@ fn handle(mut stream: TcpStream, cfg: &Config) {
         Some(r) => r,
         None => return,
     };
-    let (method, path, headers, body) = request;
+    let Request {
+        method,
+        path,
+        headers,
+        body,
+    } = request;
+
     let cors = cors_headers(cfg, headers.get("origin").map(String::as_str));
 
     if method == "OPTIONS" {
@@ -236,9 +240,17 @@ fn read_response(resp: ureq::Response) -> (u16, String, Option<String>, Vec<u8>)
 
 // ---- request parsing --------------------------------------------------------
 
-fn read_request(
-    stream: &mut TcpStream,
-) -> Option<(String, String, HashMap<String, String>, Vec<u8>)> {
+// Everything `handle` needs off the wire. Named fields rather than a tuple:
+// `method` and `path` are both String, so a tuple makes them swappable by
+// accident.
+struct Request {
+    method: String,
+    path: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end = loop {
@@ -285,7 +297,12 @@ fn read_request(
         body.extend_from_slice(&tmp[..n]);
     }
     body.truncate(len);
-    Some((method, path, headers, body))
+    Some(Request {
+        method,
+        path,
+        headers,
+        body,
+    })
 }
 
 fn write_response(
