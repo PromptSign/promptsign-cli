@@ -36,8 +36,12 @@ jobs:
             # Cross-compiled on an x86_64 runner: the binary cannot be executed
             # here, so packaging checks its architecture instead of running it.
             foreign: true
-          - os: macos-13
+          # Both darwin slices build on Apple silicon. The Xcode toolchain is
+          # universal, so cross-compiling x86_64 costs nothing — and it avoids
+          # depending on an Intel runner image, which is a retiring resource.
+          - os: macos-14
             target: x86_64-apple-darwin
+            foreign: true
           - os: macos-14
             target: aarch64-apple-darwin
           - os: windows-latest
@@ -68,11 +72,16 @@ jobs:
         run: |
           bin="target/${{ matrix.target }}/release/promptsign"
           # Smoke-test what we are about to ship. Running it is the stronger
-          # check, but a foreign-architecture build can only be inspected —
-          # which at least catches a binary built for the wrong target.
+          # check, but a cross-compiled binary can only be inspected — which at
+          # least catches one built for the wrong architecture.
           if [ "${{ matrix.foreign }}" = "true" ]; then
+            case "${{ matrix.target }}" in
+              aarch64-*) want='aarch64|arm64' ;;
+              x86_64-*)  want='x86_64|x86-64' ;;
+              *) echo "no architecture pattern for ${{ matrix.target }}" >&2; exit 1 ;;
+            esac
             file -b "$bin"
-            file -b "$bin" | grep -q 'ARM aarch64'
+            file -b "$bin" | grep -Eq "$want"
           else
             "$bin" --version
           fi
