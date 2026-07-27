@@ -1,0 +1,16 @@
+# Rust build output
+/target/
+**/target/
+
+# Local dependency override: points promptsign-core at a sibling checkout while
+# it is unpublished. Machine-specific — never committed (see README, Building).
+/.cargo/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Cargo.lock IS committed (binary crate, reproducible builds) — do not ignore it.

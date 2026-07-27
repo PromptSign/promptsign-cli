@@ -1,0 +1,89 @@
+# Build and test the CLI, then prove it still agrees with the other
+# implementation on the wire format.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Release binaries are keyless-only, so build the default feature set the
+      # way users get it...
+      - run: cargo build --locked
+
+      # ...but test with local-key enabled: the keygen/sign paths and the
+      # mocked-Sigstore e2e fixtures need it.
+      - run: cargo test --locked --features local-key
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked --features local-key -- -D warnings
+
+  conformance:
+    name: cross-implementation conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: promptsign-cli
+
+      # The suite and the second implementation are public repos.
+      - uses: actions/checkout@v7
+        with:
+          repository: PromptSign/spec
+          path: spec
+
+      - uses: actions/checkout@v7
+        with:
+          repository: PromptSign/promptsign-node
+          path: promptsign-node
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: promptsign-cli
+
+      # local-key is required: the suite signs fixtures with a local Ed25519 key.
+      - name: build signing-capable binary
+        working-directory: promptsign-cli
+        run: cargo build --locked --features local-key
+
+      - name: conformance
+        run: |
+          IMPL_A="node $GITHUB_WORKSPACE/promptsign-node/src/index.mjs" \
+          IMPL_B="$GITHUB_WORKSPACE/promptsign-cli/target/debug/promptsign" \
+          IMPL_B_SIGN_ARGS="--local-key" \
+          bash spec/test/conformance.sh

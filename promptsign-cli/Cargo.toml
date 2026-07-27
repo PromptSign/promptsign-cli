@@ -1,0 +1,32 @@
+[package]
+name = "promptsign-cli"
+description = "promptsign — sign and verify AI instruction files (single static binary)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "promptsign"
+path = "src/main.rs"
+
+[features]
+# Local-key signing (`keygen` + `sign --local-key`). Off by default so release
+# binaries are keyless-only; build with `--features local-key` to include it.
+# Verifying local-key (ed25519) bundles is always included.
+local-key = []
+
+[dependencies]
+promptsign-core = { git = "https://github.com/PromptSign/promptsign-core", tag = "v0.2.0" }
+serde_json.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+base64.workspace = true
+sha2.workspace = true
+# network lives ONLY here (keyless signing + trust fetch + interactive login);
+# the core verify path stays offline by construction
+ureq = { version = "2", features = ["json"] }
+
+[dev-dependencies]
+sha2.workspace = true
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+x509-cert = { version = "0.2", features = ["pem", "builder"] }

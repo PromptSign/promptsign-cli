@@ -1,0 +1,159 @@
+# Build the release binaries and attach them to a GitHub Release.
+#
+# Trigger by pushing a tag like `v0.2.0`. Binaries are built WITHOUT the
+# local-key feature: released CLIs are keyless-only, so signing means an
+# identity rather than a key file on a laptop. Verifying local-key bundles is
+# always compiled in.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl gives a genuinely static binary — the CLI runs inside hooks on
+          # machines where nothing is preinstalled.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            cross: true
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install cross
+        if: ${{ matrix.cross }}
+        run: cargo install cross --locked
+
+      - name: build (cross)
+        if: ${{ matrix.cross }}
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: build (cargo)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          bin="target/${{ matrix.target }}/release/promptsign"
+          "$bin" --version
+          mkdir -p dist
+          tar -czf "dist/promptsign-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" promptsign
+          (cd dist && shasum -a 256 "promptsign-${{ matrix.target }}.tar.gz" \
+            > "promptsign-${{ matrix.target }}.tar.gz.sha256")
+
+      - name: package (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/promptsign.exe"
+          "$bin" --version
+          mkdir -p dist
+          (cd "target/${{ matrix.target }}/release" && \
+            7z a "$GITHUB_WORKSPACE/dist/promptsign-${{ matrix.target }}.zip" promptsign.exe)
+          (cd dist && sha256sum "promptsign-${{ matrix.target }}.zip" \
+            > "promptsign-${{ matrix.target }}.zip.sha256")
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # create the release and upload assets
+      id-token: write        # mint the Sigstore OIDC token (keyless signing)
+      attestations: write    # record GitHub's build provenance attestation
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      # SHA256SUMS is the single list of what this release contains: it names
+      # every archive and pins its digest, and the attestation below is built
+      # from it rather than from a second copy of the same globs. Nothing may
+      # modify an archive after this step — the digests would go stale and the
+      # attestation would silently cover files that are no longer published.
+      # `tr -d '\r'` because the Windows leg writes its line, and the parser
+      # splits on the runner's line ending: a stray CR ends up inside the
+      # attested filename instead of failing.
+      - name: collect assets
+        run: |
+          mkdir -p dist
+          find artifacts -type f -exec cp {} dist/ \;
+          (cd dist && cat *.sha256 | tr -d '\r' > SHA256SUMS && rm -f *.sha256)
+          ls -l dist
+
+      # Sign the archives with the binary this workflow just built, so the
+      # downloads are verifiable with the machinery they exist to provide. The
+      # certificate binds this workflow's identity — there is no key anywhere.
+      # A checksum only proves an archive arrived intact from wherever it was
+      # fetched; this proves who built it.
+      - name: sign archives
+        run: |
+          mkdir -p /tmp/signer
+          tar -xzf dist/promptsign-x86_64-unknown-linux-musl.tar.gz -C /tmp/signer
+          chmod +x /tmp/signer/promptsign
+          # `sign` refuses to run without the Sigstore roots cached: it verifies
+          # its own output before writing it, and verification is offline.
+          /tmp/signer/promptsign trust fetch
+          for f in dist/*.tar.gz dist/*.zip; do
+            /tmp/signer/promptsign sign "$f"
+          done
+
+      # Gate: never publish a sidecar that does not verify.
+      - name: verify what we are about to publish
+        run: |
+          for f in dist/*.tar.gz dist/*.zip; do
+            /tmp/signer/promptsign verify "$f"
+          done
+          ls -l dist
+
+      # Independent of our own signature, and deliberately so: `gh attestation
+      # verify` is something a user without a trusted promptsign can already
+      # run. Verifying our binary with our binary is circular; this is not.
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
