@@ -1,25 +1,25 @@
 # promptsign (CLI)
 
-The `promptsign` command signs and verifies AI instruction files—including skills,
-agent definitions, `CLAUDE.md`, and `AGENTS.md`—along with their accompanying
-script payloads.
+The `promptsign` command signs and verifies AI instruction files, including
+skills, agent definitions, `CLAUDE.md`, and `AGENTS.md`, along with their
+accompanying script payloads.
 
 ### Architectural Constraints
 
 It ships as a **single static binary** because it runs inside `SessionStart` and
-`PreToolUse` hooks on every agent session and skill invocation. 
+`PreToolUse` hooks on every agent session and skill invocation.
 
-* **Zero Dependencies** – Consumer machines require nothing preinstalled.
-* **Instant Execution** – Startup time directly impacts perceived user latency,
+* **Zero Dependencies**: Consumer machines require nothing preinstalled.
+* **Instant Execution**: Startup time directly impacts perceived user latency,
 not build time.
 
 ### Quick Reference
 
-* **Usage** – Run `promptsign --help` for the authoritative, feature-flag-aware CLI
+* **Usage**: Run `promptsign --help` for the authoritative, feature-flag-aware CLI
 documentation.
 This file does not duplicate it.
-* **Wire Formats** – Formats are strictly defined in [PromptSign/spec](https://github.com/PromptSign/spec).
-* **Verification Logic** – Core verification architecture lives exclusively inside
+* **Wire Formats**: Formats are strictly defined in [PromptSign/spec](https://github.com/PromptSign/spec).
+* **Verification Logic**: Core verification architecture lives exclusively inside
 [`promptsign-core`](https://github.com/PromptSign/promptsign-core).
 
 ## Building
@@ -43,8 +43,8 @@ dependency in `.cargo/config.toml` (untracked) rather than editing
 promptsign-core = { path = "../promptsign-core/promptsign-core" }
 ```
 
-The path is relative to this repo's root — the parent of `.cargo/`, not the
-config file itself — so it assumes a sibling checkout:
+The path is relative to this repo's root, which is the parent of `.cargo/`
+rather than the config file itself. It therefore assumes a sibling checkout:
 
 ```
 <parent>/
@@ -63,7 +63,7 @@ While that patch is active, cargo rewrites `Cargo.lock` to drop core's
 
 Release binaries are built **without** it, so they are keyless-only: signing
 means an identity, never a key file sitting on a laptop. *Verifying* local-key
-bundles is always compiled in, regardless of the flag — old bundles keep
+bundles is always compiled in regardless of the flag, so old bundles keep
 working. Note that `--help` output differs between the two builds.
 
 ```bash
@@ -72,8 +72,9 @@ cargo build --release --features local-key
 
 ### Release profile
 
-`lto = true`, `strip = true`, `codegen-units = 1` — set at the workspace root
-and deliberate: this binary's startup time is a tax on every agent session.
+`lto = true`, `strip = true`, and `codegen-units = 1` are set at the workspace
+root, and they are deliberate. This binary's startup time is a tax on every
+agent session.
 
 `Cargo.lock` **is** committed. It is a binary crate and builds should be
 reproducible.
@@ -83,18 +84,19 @@ reproducible.
 All network access in PromptSign is in this crate, and that is an architectural
 invariant rather than an accident:
 
-- `keyless_client.rs` — Fulcio certificate request, Rekor log submission
-- `login.rs` — interactive browser sign-in, token cache
-- `proxy.rs` — local CORS proxy for in-browser signing
-- `trust fetch` / `revoke fetch` — one-time and opportunistic cache refreshes
+- `keyless_client.rs`: Fulcio certificate request, Rekor log submission
+- `login.rs`: interactive browser sign-in, token cache
+- `proxy.rs`: local CORS proxy for in-browser signing
+- `trust fetch` / `revoke fetch`: one-time and opportunistic cache refreshes
 
 `ureq` is a dependency **here only**. `promptsign-core` has no HTTP client and
 no TLS stack anywhere in its tree, which is what makes the verify path offline
 *by construction* instead of by promise. Verification must work on a plane and
 in a sealed CI sandbox, and must never be able to phone home.
 
-Adding a network call to a verify path — or a network crate to core — breaks
-this. Keep new online behavior in this crate, behind an explicit subcommand.
+Adding a network call to a verify path breaks this, as does adding a network
+crate to core. Keep new online behavior in this crate, behind an explicit
+subcommand.
 
 ## Testing
 
@@ -106,20 +108,24 @@ cargo test --features local-key     # Covers local-key code paths
 ### Keyless E2E Suite
 `tests/keyless_e2e.rs` executes the full keyless flow (token exchange, certificate issuance, log entry, stapled bundle creation, and offline verification) locally.
 
-* **Hermetic & CI-Safe** – Runs against mock Fulcio and Rekor servers started in-process. It never touches public Sigstore infrastructure.
-* **Environment Overrides** – Sigstore endpoints are redirected using:
+* **Hermetic & CI-Safe**: Runs against mock Fulcio and Rekor servers started in-process. It never touches public Sigstore infrastructure.
+* **Environment Overrides**: Sigstore endpoints are redirected using:
   * `PROMPTSIGN_FULCIO_URL`
   * `PROMPTSIGN_REKOR_URL`
 
 ### Component Coverage
-* **`login.rs`** – Unit tests covering the browser login flow.
-* **`proxy.rs`** – Unit tests covering the CORS proxy functionality.
+* **`hook.rs`**: Unit tests covering skill resolution, including the namespaced
+names and the marketplace layouts a Claude Code plugin installs into.
+* **`keyless_client.rs`**: Unit tests covering the `trust fetch` guard that
+refuses to discard cached trust material.
+* **`login.rs`**: Unit tests covering the browser login flow.
+* **`proxy.rs`**: Unit tests covering the CORS proxy functionality.
 
 ### Cross-implementation conformance
 
 `cargo test` only proves this implementation agrees with itself. The wire
 format belongs to the spec, so the suite that checks two implementations still
-agree on it lives there — `spec/test/conformance.sh` — and CI runs it against
+agree on it lives there, in `spec/test/conformance.sh`, and CI runs it against
 the Node reference on every push (the `conformance` job in
 `.github/workflows/ci.yml`).
 
@@ -134,7 +140,7 @@ looks for them as siblings:
 ```
 
 Half the suite needs this implementation to *sign*, so it needs a `local-key`
-build. Name that binary explicitly — the suite's own search prefers
+build. Name that binary explicitly. The suite's own search prefers
 `target/release` over `target/debug`, and the release profile is keyless-only,
 so a stale release binary wins and every signing check is silently **skipped**
 rather than failed:
@@ -157,7 +163,7 @@ with a local key by default.
 ## Releases
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds five
-targets and attaches the archives — plus a combined `SHA256SUMS` — to a GitHub
+targets and attaches the archives, plus a combined `SHA256SUMS`, to a GitHub
 Release:
 
 | Target | Notes |
@@ -171,14 +177,14 @@ Release:
 musl rather than glibc: this runs inside hooks on machines where nothing is
 preinstalled, and a binary bound to the host's glibc version is a binary that
 fails on someone's LTS distro. Release builds use default features, so they are
-keyless-only — see [Feature flags](#feature-flags). End users get these
+keyless-only. See [Feature flags](#feature-flags). End users get these
 prebuilt binaries from the product website; the download page is fed from these
 release assets.
 
 ### Bootstrapping trust
 
 This binary is a trust root. It decides whether everything else is authentic,
-and nothing in the system can vouch for it in turn — so it must not be
+and nothing in the system can vouch for it in turn, so it must not be
 distributed unverified. The release job therefore publishes two independent
 things alongside each archive:
 
@@ -191,7 +197,7 @@ things alongside each archive:
    `gh attestation verify`.
 
 Both are needed, because they answer different questions. A checksum only
-proves an archive arrived intact from wherever it was fetched — an attacker who
+proves an archive arrived intact from wherever it was fetched. An attacker who
 can swap the download can swap the checksum beside it. A signature proves *who
 built it*, which is the property that survives a compromised download channel.
 
@@ -200,11 +206,11 @@ attacker who swapped the download swapped the verifier too, and it will report
 OK. So the two cases differ:
 
 ```bash
-# First install — no trusted promptsign yet. `gh` is trusted independently.
+# First install. No trusted promptsign yet, and `gh` is trusted independently.
 gh attestation verify promptsign-x86_64-unknown-linux-musl.tar.gz \
   --repo PromptSign/promptsign-cli
 
-# Upgrades — an already-trusted promptsign checks the next one.
+# Upgrades. An already-trusted promptsign checks the next one.
 promptsign trust fetch      # once per machine; caches the Sigstore roots
 promptsign verify promptsign-x86_64-unknown-linux-musl.tar.gz --policy release.json
 ```
@@ -213,7 +219,9 @@ promptsign verify promptsign-x86_64-unknown-linux-musl.tar.gz --policy release.j
 cached files are lists: `fulcio.pem` contains a chain of CAs, while `rekor.pub`
 contains one block per transparency log. A signature is checked against the CA
 that issued its certificate and the log that witnessed its entry, with each
-selected by name.
+selected by name. `promptsign trust show` prints the cache location and every
+pinned log id, so what is trusted after an append is visible rather than
+assumed.
 
 When Sigstore rotates, the retired material has to stay because dropping it
 invalidates every signature made under it. Fulcio and Rekor serve only what is
@@ -239,4 +247,4 @@ are a separate track from the signing described here.
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE).
