@@ -293,8 +293,7 @@ fn ensure_no_loss(path: &std::path::Path, label: &str, fetched: &str) -> Result<
             .to_string(),
         "the CA that issued its certificate, so discarding retired material invalidates every"
             .to_string(),
-        "signature made under it. These endpoints only ever serve what is current."
-            .to_string(),
+        "signature made under it. These endpoints only ever serve what is current.".to_string(),
         String::new(),
         "To take the new root and keep the old:".to_string(),
         "    scratch=$(mktemp -d)".to_string(),
