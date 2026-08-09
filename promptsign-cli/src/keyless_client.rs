@@ -7,7 +7,9 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::{Signer, SigningKey};
 use promptsign_core::bundle::{pae, BUNDLE_SCHEMA};
-use promptsign_core::keyless::{chain_leaf_info, pem_chain_to_b64_der, trust_dir, trusted_log_id};
+use promptsign_core::keyless::{
+    chain_leaf_info, pem_chain_to_b64_der, trust_dir, trusted_log_id, trusted_log_ids,
+};
 use promptsign_core::revocation::{
     feed_path, load_cached_feed, verify_feed, RevocationEntry, RevocationFeed,
     REVOCATION_PAYLOAD_TYPE, REVOCATION_SCHEMA,
@@ -360,7 +362,16 @@ pub fn trust_show() -> Result<()> {
     let dir = trust_dir();
 
     println!("trust dir: {}", dir.display());
-    println!("rekor log id: {}", trusted_log_id()?);
+    // This lists every pinned log, not just the current one. After a rotation,
+    // the retired keys are what keep older signatures verifying, so an operator
+    // needs to see that they are still present.
+    for (i, id) in trusted_log_ids()?.iter().enumerate() {
+        if i == 0 {
+            println!("rekor log id: {id}");
+        } else {
+            println!("  also trusted: {id}");
+        }
+    }
     Ok(())
 }
 

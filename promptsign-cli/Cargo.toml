@@ -16,7 +16,7 @@ path = "src/main.rs"
 local-key = []
 
 [dependencies]
-promptsign-core = { git = "https://github.com/PromptSign/promptsign-core", tag = "v0.2.0" }
+promptsign-core = { git = "https://github.com/PromptSign/promptsign-core", tag = "v0.3.0" }
 serde_json.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true

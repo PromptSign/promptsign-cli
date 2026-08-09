@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "promptsign-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -570,8 +570,8 @@ dependencies = [
 
 [[package]]
 name = "promptsign-core"
-version = "0.2.0"
-source = "git+https://github.com/PromptSign/promptsign-core?tag=v0.2.0#78e709576f52d4fb5f43e7a9e571878a646051ba"
+version = "0.3.0"
+source = "git+https://github.com/PromptSign/promptsign-core?tag=v0.3.0#463325def852a088d7dacff58ad0cdcf0c2fea8f"
 dependencies = [
  "base64",
  "der",

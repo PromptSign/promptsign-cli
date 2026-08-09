@@ -1,8 +1,8 @@
-// PromptSign hook for Claude Code and Codex CLI — in-process port of
-// hooks/promptsign-hook.mjs, so enforcement needs no Node runtime and no
+// PromptSign hook for Claude Code and Codex CLI: an in-process port of
+// hooks/promptsign-hook.mjs, so enforcement needs no Node runtime or
 // subprocess. Skill resolution also searches OpenClaw skill roots, so a
-// machine running both harnesses gets consistent coverage (OpenClaw itself is
-// integrated via hooks/openclaw/, not this stdin protocol). Reads the hook
+// machine running both harnesses gets consistent coverage. OpenClaw itself is
+// integrated via hooks/openclaw/, not this stdin protocol. Reads the hook
 // event JSON from stdin:
 //
 //   SessionStart      — verify-tree over project + user instruction dirs;
@@ -75,26 +75,99 @@ fn skill_roots(project_dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
-/// Skill names may be namespaced ("plugin:skill", "dir:skill") — try the full
-/// name and the last segment against each root.
-fn resolve_skill_dir(skill_name: &str, project_dir: &Path) -> Option<PathBuf> {
-    let last = skill_name.rsplit(':').next().unwrap_or(skill_name);
-    let candidates: Vec<&str> = if last == skill_name {
-        vec![skill_name]
-    } else {
-        vec![skill_name, last]
+fn is_skill_dir(dir: &Path) -> bool {
+    dir.join("SKILL.md").exists()
+}
+
+fn marketplaces_dir() -> PathBuf {
+    home_dir()
+        .join(".claude")
+        .join("plugins")
+        .join("marketplaces")
+}
+
+/// Returns the immediate subdirectories of `dir` in sorted order, or an empty
+/// list if it cannot be read. Sorting keeps resolution deterministic when two
+/// marketplaces happen to offer the same skill name.
+fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path())
+            .collect(),
+        Err(_) => return Vec::new(),
     };
 
-    for root in skill_roots(project_dir) {
-        for name in &candidates {
-            let dir = root.join(name);
+    out.sort();
+    out
+}
 
-            if dir.join("SKILL.md").exists() {
-                return Some(dir);
+/// Directories a marketplace groups its plugins under. The official catalog
+/// uses both. Third-party plugins live under external_plugins.
+const PLUGIN_CONTAINERS: [&str; 2] = ["plugins", "external_plugins"];
+
+/// Skills that arrive through a Claude Code plugin live under the marketplace
+/// checkout, not under any skills/ root. They are either under
+/// <marketplace>/skills/<name> for a plugin published from its repo root, or
+/// <marketplace>/<container>/<plugin>/skills/<name> for a monorepo. These paths
+/// are searched only after the plain roots miss and only one level deep, so a
+/// miss stays cheap.
+fn plugin_skill_dir(name: &str, marketplaces: &Path) -> Option<PathBuf> {
+    for market in subdirs(marketplaces) {
+        let direct = market.join("skills").join(name);
+
+        if is_skill_dir(&direct) {
+            return Some(direct);
+        }
+        for container in PLUGIN_CONTAINERS {
+            for plugin in subdirs(&market.join(container)) {
+                let nested = plugin.join("skills").join(name);
+
+                if is_skill_dir(&nested) {
+                    return Some(nested);
+                }
             }
         }
     }
     None
+}
+
+/// Skill names may be namespaced, as in "plugin:skill" or "dir:skill". Both the
+/// full name and the last segment are tried.
+fn skill_name_candidates(skill_name: &str) -> Vec<&str> {
+    let last = skill_name.rsplit(':').next().unwrap_or(skill_name);
+
+    if last == skill_name {
+        vec![skill_name]
+    } else {
+        vec![skill_name, last]
+    }
+}
+
+fn resolve_skill_dir_in(
+    skill_name: &str,
+    roots: &[PathBuf],
+    marketplaces: &Path,
+) -> Option<PathBuf> {
+    let candidates = skill_name_candidates(skill_name);
+
+    for root in roots {
+        for name in &candidates {
+            let dir = root.join(name);
+
+            if is_skill_dir(&dir) {
+                return Some(dir);
+            }
+        }
+    }
+    candidates
+        .iter()
+        .find_map(|name| plugin_skill_dir(name, marketplaces))
+}
+
+fn resolve_skill_dir(skill_name: &str, project_dir: &Path) -> Option<PathBuf> {
+    resolve_skill_dir_in(skill_name, &skill_roots(project_dir), &marketplaces_dir())
 }
 
 pub fn cmd_hook(rest: &[String]) -> ExitCode {
@@ -271,4 +344,163 @@ fn session_start(project_dir: &Path) -> ExitCode {
         );
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gives each test its own scratch directory. Every test in a binary shares
+    /// one pid, so the name has to carry a per-test tag or the parallel runner
+    /// would let two tests write to the same path.
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pshook-{}-{tag}", std::process::id()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn make_skill(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: fixture\ndescription: fixture\n---\n\nbody\n",
+        )
+        .unwrap();
+        dir.to_path_buf()
+    }
+
+    #[test]
+    fn namespaced_names_try_the_full_name_then_the_last_segment() {
+        assert_eq!(skill_name_candidates("verify"), vec!["verify"]);
+        assert_eq!(
+            skill_name_candidates("promptsign:verify"),
+            vec!["promptsign:verify", "verify"]
+        );
+        // Only the last segment, however deep the namespace goes.
+        assert_eq!(skill_name_candidates("a:b:c"), vec!["a:b:c", "c"]);
+    }
+
+    #[test]
+    fn finds_a_skill_published_from_a_marketplace_root() {
+        let tmp = tmp_dir("mkt-root");
+        let want = make_skill(&tmp.join("promptsign").join("skills").join("verify"));
+
+        assert_eq!(plugin_skill_dir("verify", &tmp), Some(want));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn finds_a_skill_inside_a_marketplace_monorepo() {
+        let tmp = tmp_dir("mkt-monorepo");
+        let want = make_skill(
+            &tmp.join("acme")
+                .join("plugins")
+                .join("tools")
+                .join("skills")
+                .join("verify"),
+        );
+
+        assert_eq!(plugin_skill_dir("verify", &tmp), Some(want));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_directory_without_a_skill_md_is_not_a_skill() {
+        let tmp = tmp_dir("mkt-no-skill-md");
+
+        std::fs::create_dir_all(tmp.join("promptsign").join("skills").join("verify")).unwrap();
+        assert_eq!(plugin_skill_dir("verify", &tmp), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn finds_a_skill_under_a_marketplaces_external_plugins() {
+        let tmp = tmp_dir("mkt-external");
+        let want = make_skill(
+            &tmp.join("acme")
+                .join("external_plugins")
+                .join("telegram")
+                .join("skills")
+                .join("access"),
+        );
+
+        assert_eq!(plugin_skill_dir("access", &tmp), Some(want));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_monorepo_search_stays_one_level_deep() {
+        let tmp = tmp_dir("mkt-too-deep");
+
+        make_skill(
+            &tmp.join("acme")
+                .join("plugins")
+                .join("group")
+                .join("tools")
+                .join("skills")
+                .join("verify"),
+        );
+        assert_eq!(plugin_skill_dir("verify", &tmp), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_missing_marketplaces_directory_is_a_miss_not_an_error() {
+        let tmp = tmp_dir("mkt-absent");
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert_eq!(plugin_skill_dir("verify", &tmp), None);
+    }
+
+    #[test]
+    fn a_namespaced_plugin_skill_resolves_by_its_last_segment() {
+        let tmp = tmp_dir("resolve-namespaced");
+        let want = make_skill(
+            &tmp.join("marketplaces")
+                .join("promptsign")
+                .join("skills")
+                .join("verify"),
+        );
+        let roots = vec![tmp.join("empty-root")];
+
+        assert_eq!(
+            resolve_skill_dir_in("promptsign:verify", &roots, &tmp.join("marketplaces")),
+            Some(want)
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn plain_roots_win_over_the_marketplace_copy() {
+        let tmp = tmp_dir("resolve-precedence");
+        let want = make_skill(&tmp.join("root").join("verify"));
+
+        make_skill(
+            &tmp.join("marketplaces")
+                .join("promptsign")
+                .join("skills")
+                .join("verify"),
+        );
+        let roots = vec![tmp.join("root")];
+
+        assert_eq!(
+            resolve_skill_dir_in("verify", &roots, &tmp.join("marketplaces")),
+            Some(want)
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn an_unresolvable_skill_is_still_a_miss() {
+        let tmp = tmp_dir("resolve-miss");
+        let roots = vec![tmp.join("root")];
+
+        assert_eq!(
+            resolve_skill_dir_in("nonexistent", &roots, &tmp.join("marketplaces")),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
