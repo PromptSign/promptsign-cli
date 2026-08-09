@@ -1,9 +1,8 @@
-// PromptSign hook for Claude Code and Codex CLI: an in-process port of
-// hooks/promptsign-hook.mjs, so enforcement needs no Node runtime or
-// subprocess. Skill resolution also searches OpenClaw skill roots, so a
-// machine running both harnesses gets consistent coverage. OpenClaw itself is
-// integrated via hooks/openclaw/, not this stdin protocol. Reads the hook
-// event JSON from stdin:
+// PromptSign hook for Claude Code and Codex CLI, implemented in-process so
+// enforcement needs no Node runtime or subprocess. Skill resolution also
+// searches OpenClaw skill roots, so a machine running both harnesses gets
+// consistent coverage. OpenClaw itself is integrated via hooks/openclaw/,
+// not this stdin protocol. Reads the hook event JSON from stdin:
 //
 //   SessionStart      — verify-tree over project + user instruction dirs;
 //                       failures are reported into session context (non-blocking
