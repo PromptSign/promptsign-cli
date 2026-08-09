@@ -36,10 +36,10 @@ Usage:
   promptsign login [--print-token]   (interactive browser sign-in; caches a token for signing)
   promptsign sign <dir|file> [--identity-token <jwt>] [--embed] [--name n] [--version v] [--kind k]
   promptsign verify <dir|file> [--policy path] [--json] [--no-pin-updates]
-  promptsign verify-tree <root>... [--policy path] [--json] [--quiet]
+  promptsign verify-tree <root>... [--policy path] [--json] [--quiet] [--no-pin-updates]
   promptsign policy init [--global]
   promptsign pin list | pin rm <name>
-  promptsign trust fetch | trust show    (cache Sigstore roots for offline verify)
+  promptsign trust fetch [--force] | trust show   (cache Sigstore roots for offline verify)
   promptsign revoke fetch | revoke show  (refresh/inspect the cached revocation feed)
   promptsign revoke sign <entries.json> [--out path]   (publish a signed revocation feed)
   promptsign hook [event]     (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
@@ -66,10 +66,10 @@ Usage:
   promptsign sign <dir|file> --local-key [--identity id] [--key path] [--embed] [--name n] [--version v] [--kind k]
   promptsign keygen [--identity <id>] [--force]
   promptsign verify <dir|file> [--policy path] [--json] [--no-pin-updates]
-  promptsign verify-tree <root>... [--policy path] [--json] [--quiet]
+  promptsign verify-tree <root>... [--policy path] [--json] [--quiet] [--no-pin-updates]
   promptsign policy init [--global]
   promptsign pin list | pin rm <name>
-  promptsign trust fetch | trust show    (cache Sigstore roots for offline verify)
+  promptsign trust fetch [--force] | trust show   (cache Sigstore roots for offline verify)
   promptsign revoke fetch | revoke show  (refresh/inspect the cached revocation feed)
   promptsign revoke sign <entries.json> [--out path]   (publish a signed revocation feed)
   promptsign hook [event]     (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
@@ -497,9 +497,13 @@ fn cmd_sign(rest: &[String]) -> ExitCode {
 
 fn cmd_trust(rest: &[String]) -> ExitCode {
     match rest.first().map(String::as_str) {
-        Some("fetch") => keyless_client::trust_fetch()
-            .map(|_| ExitCode::SUCCESS)
-            .unwrap_or_else(|e| fail(&e)),
+        Some("fetch") => {
+            let p = args::parse(&rest[1..], &[], &["force"]).unwrap_or_else(|e| fail(&e));
+
+            keyless_client::trust_fetch(p.flags.contains("force"))
+                .map(|_| ExitCode::SUCCESS)
+                .unwrap_or_else(|e| fail(&e))
+        }
         Some("show") => keyless_client::trust_show()
             .map(|_| ExitCode::SUCCESS)
             .unwrap_or_else(|e| fail(&e)),

@@ -209,6 +209,18 @@ promptsign trust fetch      # once per machine; caches the Sigstore roots
 promptsign verify promptsign-x86_64-unknown-linux-musl.tar.gz --policy release.json
 ```
 
+`trust fetch` is safe to re-run, and it will refuse rather than discard. The
+cached files are lists: `fulcio.pem` contains a chain of CAs, while `rekor.pub`
+contains one block per transparency log. A signature is checked against the CA
+that issued its certificate and the log that witnessed its entry, with each
+selected by name.
+
+When Sigstore rotates, the retired material has to stay because dropping it
+invalidates every signature made under it. Fulcio and Rekor serve only what is
+*current*, so if the cache holds anything the response does not, `trust fetch`
+stops and tells you how to append instead. `--force` overwrites anyway and
+accepts that loss.
+
 Keep the `.psig.json` sidecar next to the archive under its original name; that
 pairing is how `verify` finds it. Bare `promptsign verify` pins the signer on
 first use (TOFU) and holds across releases, since archive names carry the

@@ -233,9 +233,82 @@ pub fn keyless_sign(
     })
 }
 
+/// Decoded DER of every PEM block carrying this label. Comparing decoded bytes
+/// rather than text makes the clobber check below insensitive to line endings,
+/// block order, and re-wrapping.
+fn pem_block_ders(pem: &str, label: &str) -> Vec<Vec<u8>> {
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let mut out = Vec::new();
+    let mut rest = pem;
+
+    while let Some(start) = rest.find(&begin) {
+        let after = &rest[start + begin.len()..];
+        let Some(stop) = after.find(&end) else { break };
+        let b64: String = after[..stop]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+        if let Ok(der) = BASE64_STANDARD.decode(&b64) {
+            out.push(der);
+        }
+        rest = &after[stop + end.len()..];
+    }
+    out
+}
+
+/// Refuse to drop trust material that is already on disk.
+///
+/// Trust-root files are lists, and rotation appends to them: a signature is
+/// verified against the log that witnessed it and the CA that issued its
+/// certificate, each selected by name, so retired material has to survive a
+/// refresh or everything signed under it stops verifying. These endpoints serve
+/// only what is *current*, so writing the response over an appended file is
+/// exactly how that loss would happen — silently, on a routine command.
+fn ensure_no_loss(path: &std::path::Path, label: &str, fetched: &str) -> Result<()> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return Ok(()), // nothing cached yet: nothing to lose
+    };
+    let incoming = pem_block_ders(fetched, label);
+    let dropped = pem_block_ders(&existing, label)
+        .into_iter()
+        .filter(|der| !incoming.contains(der))
+        .count();
+
+    if dropped == 0 {
+        return Ok(());
+    }
+
+    let file = path.display();
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+
+    Err([
+        format!(
+            "refusing to overwrite {file}: it holds {dropped} entry(s) the fetched root does not."
+        ),
+        String::new(),
+        "Rotation is append-only. A signature is checked against the log that witnessed it and"
+            .to_string(),
+        "the CA that issued its certificate, so discarding retired material invalidates every"
+            .to_string(),
+        "signature made under it. These endpoints only ever serve what is current."
+            .to_string(),
+        String::new(),
+        "To take the new root and keep the old:".to_string(),
+        "    scratch=$(mktemp -d)".to_string(),
+        "    PROMPTSIGN_TRUST_DIR=$scratch promptsign trust fetch".to_string(),
+        format!("    cat $scratch/{name} >> {file}"),
+        String::new(),
+        "Or `promptsign trust fetch --force` to overwrite anyway and accept the loss.".to_string(),
+    ]
+    .join("\n"))
+}
+
 /// One-time online step: cache the Fulcio CA chain and Rekor public key so
 /// every subsequent keyless verification is offline.
-pub fn trust_fetch() -> Result<()> {
+pub fn trust_fetch(force: bool) -> Result<()> {
     let dir = trust_dir();
 
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -243,6 +316,9 @@ pub fn trust_fetch() -> Result<()> {
     let fulcio = env_url("PROMPTSIGN_FULCIO_URL", DEFAULT_FULCIO);
     let rekor = env_url("PROMPTSIGN_REKOR_URL", DEFAULT_REKOR);
 
+    // Both are fetched and validated before either is written: a half-updated
+    // trust dir — new CA, stale log key — verifies nothing, and is worse than
+    // never having run the command.
     let ca_pem = agent()
         .get(&format!("{fulcio}/api/v1/rootCert"))
         .call()
@@ -252,18 +328,26 @@ pub fn trust_fetch() -> Result<()> {
 
     pem_chain_to_b64_der(ca_pem.as_bytes())?; // validate before persisting
 
-    let fulcio_path = dir.join("fulcio.pem");
-
-    std::fs::write(&fulcio_path, &ca_pem).map_err(|e| format!("{}: {e}", fulcio_path.display()))?;
-
     let rekor_pem = agent()
         .get(&format!("{rekor}/api/v1/log/publicKey"))
         .call()
         .map_err(|e| http_err("Rekor", e))?
         .into_string()
         .map_err(|e| format!("Rekor: {e}"))?;
+
+    if pem_block_ders(&rekor_pem, "PUBLIC KEY").is_empty() {
+        return Err("Rekor: response is not a PEM public key".to_string());
+    }
+
+    let fulcio_path = dir.join("fulcio.pem");
     let rekor_path = dir.join("rekor.pub");
 
+    if !force {
+        ensure_no_loss(&fulcio_path, "CERTIFICATE", &ca_pem)?;
+        ensure_no_loss(&rekor_path, "PUBLIC KEY", &rekor_pem)?;
+    }
+
+    std::fs::write(&fulcio_path, &ca_pem).map_err(|e| format!("{}: {e}", fulcio_path.display()))?;
     std::fs::write(&rekor_path, &rekor_pem)
         .map_err(|e| format!("{}: {e}", rekor_path.display()))?;
 
@@ -409,4 +493,111 @@ pub fn revoke_sign(
     println!("transparency log index: {}", outcome.log_index);
     println!("serve this file at your policy's revocation_feed URL, then `promptsign revoke fetch` on consumers");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_no_loss, pem_block_ders};
+    use base64::prelude::{Engine as _, BASE64_STANDARD};
+
+    fn block(label: &str, bytes: &[u8]) -> String {
+        format!(
+            "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+            BASE64_STANDARD.encode(bytes)
+        )
+    }
+
+    fn at(name: &str, contents: Option<&str>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pstrustguard-{}", std::process::id()));
+
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let p = dir.join(name);
+
+        match contents {
+            Some(c) => std::fs::write(&p, c).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn reads_every_block_in_a_file() {
+        let pem = format!(
+            "{}{}",
+            block("PUBLIC KEY", b"one"),
+            block("PUBLIC KEY", b"two")
+        );
+
+        assert_eq!(
+            pem_block_ders(&pem, "PUBLIC KEY"),
+            vec![b"one".to_vec(), b"two".to_vec()]
+        );
+        assert!(pem_block_ders(&pem, "CERTIFICATE").is_empty());
+    }
+
+    #[test]
+    fn nothing_cached_is_never_a_loss() {
+        let p = at("absent.pub", None);
+
+        assert!(ensure_no_loss(&p, "PUBLIC KEY", &block("PUBLIC KEY", b"new")).is_ok());
+    }
+
+    #[test]
+    fn refetching_the_same_root_is_fine() {
+        let same = block("PUBLIC KEY", b"current");
+        let p = at("same.pub", Some(&same));
+
+        assert!(ensure_no_loss(&p, "PUBLIC KEY", &same).is_ok());
+    }
+
+    #[test]
+    fn line_endings_and_wrapping_are_not_a_difference() {
+        let p = at(
+            "crlf.pub",
+            Some(&block("PUBLIC KEY", b"current").replace('\n', "\r\n")),
+        );
+
+        assert!(ensure_no_loss(&p, "PUBLIC KEY", &block("PUBLIC KEY", b"current")).is_ok());
+    }
+
+    #[test]
+    fn upstream_serving_more_than_we_have_is_fine() {
+        let p = at("subset.pub", Some(&block("PUBLIC KEY", b"current")));
+        let fetched = format!(
+            "{}{}",
+            block("PUBLIC KEY", b"rotated"),
+            block("PUBLIC KEY", b"current")
+        );
+
+        assert!(ensure_no_loss(&p, "PUBLIC KEY", &fetched).is_ok());
+    }
+
+    // The case the guard exists for: rekor.pub was appended to during a
+    // rotation, and a later `trust fetch` would drop the retired key.
+    #[test]
+    fn dropping_an_appended_key_is_refused() {
+        let appended = format!(
+            "{}{}",
+            block("PUBLIC KEY", b"rotated"),
+            block("PUBLIC KEY", b"retired")
+        );
+        let p = at("appended.pub", Some(&appended));
+        let err = ensure_no_loss(&p, "PUBLIC KEY", &block("PUBLIC KEY", b"rotated")).unwrap_err();
+
+        assert!(err.contains("refusing to overwrite"), "{err}");
+        assert!(err.contains("1 entry(s)"), "{err}");
+        assert!(err.contains("--force"), "{err}");
+        assert!(err.contains("appended.pub >>"), "{err}");
+    }
+
+    #[test]
+    fn a_wholly_different_root_is_refused_too() {
+        let p = at("replaced.pem", Some(&block("CERTIFICATE", b"ours")));
+        let err = ensure_no_loss(&p, "CERTIFICATE", &block("CERTIFICATE", b"theirs")).unwrap_err();
+
+        assert!(err.contains("refusing to overwrite"), "{err}");
+    }
 }
