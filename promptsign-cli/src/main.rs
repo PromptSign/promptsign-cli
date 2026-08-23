@@ -37,7 +37,7 @@ Usage:
   promptsign sign <dir|file> [--identity-token <jwt>] [--embed] [--name n] [--version v] [--kind k]
   promptsign verify <dir|file> [--policy path] [--json] [--no-pin-updates]
   promptsign verify-tree <root>... [--policy path] [--json] [--quiet] [--no-pin-updates]
-  promptsign policy init [--global]
+  promptsign policy init [--global] | policy show  (the effective policy and its source)
   promptsign pin list | pin rm <name>
   promptsign trust fetch [--force] | trust show   (cache Sigstore roots for offline verify)
   promptsign revoke fetch | revoke show  (refresh/inspect the cached revocation feed)
@@ -67,7 +67,7 @@ Usage:
   promptsign keygen [--identity <id>] [--force]
   promptsign verify <dir|file> [--policy path] [--json] [--no-pin-updates]
   promptsign verify-tree <root>... [--policy path] [--json] [--quiet] [--no-pin-updates]
-  promptsign policy init [--global]
+  promptsign policy init [--global] | policy show  (the effective policy and its source)
   promptsign pin list | pin rm <name>
   promptsign trust fetch [--force] | trust show   (cache Sigstore roots for offline verify)
   promptsign revoke fetch | revoke show  (refresh/inspect the cached revocation feed)
