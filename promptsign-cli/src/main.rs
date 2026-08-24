@@ -124,6 +124,26 @@ fn use_color() -> bool {
     std::env::var_os("FORCE_COLOR").is_some() || std::io::stdout().is_terminal()
 }
 
+/// Runtime bookkeeping a harness writes into an artifact directory *after* it
+/// has installed and pinned it. Naming it in the report is explanation only:
+/// the finding stands and the verdict is unchanged.
+///
+/// This deliberately does not live in the manifest's skip list. A stale name
+/// here degrades to the plain message, while a stale name in the skip list
+/// degrades to hiding a genuinely added file, and "the manifest lists every
+/// file" is the property that makes a deleted one detectable. Explanation is
+/// the safe place to put knowledge of another product's internal filenames.
+fn harness_note(rel_path: &str) -> Option<&'static str> {
+    let first = rel_path.split('/').next().unwrap_or(rel_path);
+
+    match (first, rel_path) {
+        (".in_use", _) | (_, ".orphaned_at") => Some(
+            "Claude Code plugin bookkeeping, written into this directory after install.",
+        ),
+        _ => None,
+    }
+}
+
 pub fn format_result(r: &VerifyResult, color: bool) -> String {
     let (label, codes) = if r.signed {
         match r.action {
@@ -157,6 +177,15 @@ pub fn format_result(r: &VerifyResult, color: bool) -> String {
         };
         let level = paint(&f.level.to_uppercase(), codes, color);
         let _ = writeln!(out, "       {level}: {}", f.message);
+
+        if let Some(note) = f
+            .message
+            .strip_prefix("unlisted file present: ")
+            .and_then(harness_note)
+        {
+            let note = paint(&format!("note: {note}"), color::DIM, color);
+            let _ = writeln!(out, "              {note}");
+        }
     }
     out
 }
@@ -699,5 +728,89 @@ fn main() -> ExitCode {
         other => fail(&format!(
             "unknown command \"{other}\" (try: promptsign help)"
         )),
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+    use promptsign_core::policy::Finding;
+
+    fn finding(message: &str) -> Finding {
+        Finding {
+            level: "error".to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    fn failing_result(findings: Vec<Finding>) -> VerifyResult {
+        VerifyResult {
+            target: "/plugins/cache/promptsign/promptsign/0.3.0".to_string(),
+            policy_source: "built-in".to_string(),
+            name: "promptsign".to_string(),
+            version: None,
+            kind: None,
+            identity: None,
+            issuer: None,
+            keyid: None,
+            integrated_time: None,
+            signed: true,
+            action: Action::Fail,
+            findings,
+        }
+    }
+
+    #[test]
+    fn harness_bookkeeping_is_explained_but_still_reported_as_an_error() {
+        let out = format_result(
+            &failing_result(vec![finding("unlisted file present: .in_use/37960")]),
+            false,
+        );
+
+        assert!(out.contains("ERROR: unlisted file present: .in_use/37960"));
+        assert!(out.contains("note: Claude Code plugin bookkeeping"));
+    }
+
+    #[test]
+    fn the_orphan_marker_is_explained_too() {
+        let out = format_result(
+            &failing_result(vec![finding("unlisted file present: .orphaned_at")]),
+            false,
+        );
+
+        assert!(out.contains("note: Claude Code plugin bookkeeping"));
+    }
+
+    /// The note must never attach to an ordinary added file, which is the case
+    /// the unlisted-file check exists for in the first place.
+    #[test]
+    fn an_ordinary_added_file_gets_no_note() {
+        let out = format_result(
+            &failing_result(vec![finding("unlisted file present: skills/evil.md")]),
+            false,
+        );
+
+        assert!(out.contains("unlisted file present: skills/evil.md"));
+        assert!(!out.contains("note:"));
+    }
+
+    /// A path that merely contains the name is not the bookkeeping directory.
+    #[test]
+    fn a_lookalike_path_gets_no_note() {
+        let out = format_result(
+            &failing_result(vec![finding("unlisted file present: skills/.in_use.md")]),
+            false,
+        );
+
+        assert!(!out.contains("note:"));
+    }
+
+    /// Every other finding kind is untouched: only the unlisted-file message
+    /// carries a path this can reason about.
+    #[test]
+    fn a_modified_file_gets_no_note() {
+        let out = format_result(&failing_result(vec![finding("modified: .in_use/37960")]), false);
+
+        assert!(!out.contains("note:"));
     }
 }
