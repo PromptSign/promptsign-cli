@@ -137,9 +137,9 @@ fn harness_note(rel_path: &str) -> Option<&'static str> {
     let first = rel_path.split('/').next().unwrap_or(rel_path);
 
     match (first, rel_path) {
-        (".in_use", _) | (_, ".orphaned_at") => Some(
-            "Claude Code plugin bookkeeping, written into this directory after install.",
-        ),
+        (".in_use", _) | (_, ".orphaned_at") => {
+            Some("Claude Code plugin bookkeeping, written into this directory after install.")
+        }
         _ => None,
     }
 }
@@ -809,7 +809,10 @@ mod report_tests {
     /// carries a path this can reason about.
     #[test]
     fn a_modified_file_gets_no_note() {
-        let out = format_result(&failing_result(vec![finding("modified: .in_use/37960")]), false);
+        let out = format_result(
+            &failing_result(vec![finding("modified: .in_use/37960")]),
+            false,
+        );
 
         assert!(!out.contains("note:"));
     }
