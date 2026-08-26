@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "promptsign-cli"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -570,9 +570,9 @@ dependencies = [
 
 [[package]]
 name = "promptsign-core"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79a17283b8fd56ea503fe98e06538f76f327f4569ffd0e9a94592843378ad90d"
+checksum = "ff9581a504a13f7332b94921248b13d2b2a58788df00e4ff203c5efd80f2f995"
 dependencies = [
  "base64",
  "der",

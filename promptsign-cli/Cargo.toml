@@ -16,7 +16,7 @@ path = "src/main.rs"
 local-key = []
 
 [dependencies]
-promptsign-core = "0.3.1"
+promptsign-core = "0.3.2"
 serde_json.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true

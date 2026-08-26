@@ -16,7 +16,7 @@ use promptsign_core::bundle::{sign_manifest, write_bundle};
 use promptsign_core::keys::{default_identity, default_key_path, keygen, load_private_key};
 use promptsign_core::manifest::{build_manifest, BuildOptions};
 use promptsign_core::policy::{default_policy, load_pins, load_policy, save_pins, Action};
-use promptsign_core::util::{promptsign_home, short16};
+use promptsign_core::util::{promptsign_home, short16, write_private};
 use promptsign_core::verify::{verify_target, VerifyOptions, VerifyResult};
 use promptsign_core::verifytree::verify_tree;
 use std::fmt::Write as _;
@@ -631,7 +631,8 @@ fn cmd_policy(rest: &[String]) -> ExitCode {
     match rest.first().map(String::as_str) {
         Some("init") => {
             let p = args::parse(&rest[1..], &[], &["global"]).unwrap_or_else(|e| fail(&e));
-            let dir = if p.flags.contains("global") {
+            let global = p.flags.contains("global");
+            let dir = if global {
                 promptsign_home()
             } else {
                 std::env::current_dir()
@@ -647,7 +648,18 @@ fn cmd_policy(rest: &[String]) -> ExitCode {
 
             let json = serde_json::to_string_pretty(&default_policy()).unwrap();
 
-            std::fs::write(&path, json + "\n").unwrap_or_else(|e| fail(&e.to_string()));
+            // A global policy is one user's, so it is written 0600 like the key
+            // and the pin store beside it. A project policy is meant to be
+            // committed and read by everyone who checks the repository out,
+            // including CI under another account, so it keeps the umask's
+            // permissions.
+            let written = if global {
+                write_private(&path, json + "\n")
+            } else {
+                std::fs::write(&path, json + "\n")
+            };
+
+            written.unwrap_or_else(|e| fail(&e.to_string()));
             println!("wrote {}", path.display());
             ExitCode::SUCCESS
         }
