@@ -78,11 +78,57 @@ fn is_skill_dir(dir: &Path) -> bool {
     dir.join("SKILL.md").exists()
 }
 
-fn marketplaces_dir() -> PathBuf {
-    home_dir()
-        .join(".claude")
-        .join("plugins")
-        .join("marketplaces")
+fn plugins_dir() -> PathBuf {
+    home_dir().join(".claude").join("plugins")
+}
+
+/// Claude Code records every plugin install in `installed_plugins.json`, keyed
+/// `<plugin>@<marketplace>`, each entry carrying the exact `installPath` under
+/// `plugins/cache/`. That file is the only authority on which copy is live:
+/// several versions of one plugin can sit in the cache side by side, and the
+/// marketplace checkout beside them is a separate copy that moves on its own.
+fn installed_plugins(plugins_dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    let raw = match std::fs::read_to_string(plugins_dir.join("installed_plugins.json")) {
+        Ok(raw) => raw,
+        Err(_) => return out,
+    };
+    let parsed: Value = match serde_json::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(_) => return out,
+    };
+    let plugins = match parsed.get("plugins").and_then(|v| v.as_object()) {
+        Some(plugins) => plugins,
+        None => return out,
+    };
+
+    for (key, entries) in plugins {
+        let plugin = key.split('@').next().unwrap_or(key);
+
+        for entry in entries.as_array().into_iter().flatten() {
+            if let Some(install) = entry.get("installPath").and_then(|v| v.as_str()) {
+                out.push((plugin.to_string(), PathBuf::from(install)));
+            }
+        }
+    }
+    out
+}
+
+/// A plugin skill runs from its install path, so that is the copy that has to
+/// be verified. A namespaced name carries the owning plugin, so that plugin's
+/// install is tried before the others.
+fn installed_skill_dir(skill_name: &str, plugins_dir: &Path) -> Option<PathBuf> {
+    let candidates = skill_name_candidates(skill_name);
+    let namespace = skill_name.rsplit_once(':').map(|(ns, _)| ns);
+    let mut installs = installed_plugins(plugins_dir);
+
+    installs.sort_by_key(|(plugin, _)| Some(plugin.as_str()) != namespace);
+    installs.iter().find_map(|(_, install)| {
+        candidates
+            .iter()
+            .map(|name| install.join("skills").join(name))
+            .find(|dir| is_skill_dir(dir))
+    })
 }
 
 /// Returns the immediate subdirectories of `dir` in sorted order, or an empty
@@ -106,12 +152,11 @@ fn subdirs(dir: &Path) -> Vec<PathBuf> {
 /// uses both. Third-party plugins live under external_plugins.
 const PLUGIN_CONTAINERS: [&str; 2] = ["plugins", "external_plugins"];
 
-/// Skills that arrive through a Claude Code plugin live under the marketplace
-/// checkout, not under any skills/ root. They are either under
-/// <marketplace>/skills/<name> for a plugin published from its repo root, or
-/// <marketplace>/<container>/<plugin>/skills/<name> for a monorepo. These paths
-/// are searched only after the plain roots miss and only one level deep, so a
-/// miss stays cheap.
+/// Fallback for a machine whose `installed_plugins.json` is missing or does not
+/// list the skill: the marketplace checkout. A plugin published from its repo
+/// root sits at <marketplace>/skills/<name>, a monorepo one at
+/// <marketplace>/<container>/<plugin>/skills/<name>. These paths are searched
+/// only one level deep, so a miss stays cheap.
 fn plugin_skill_dir(name: &str, marketplaces: &Path) -> Option<PathBuf> {
     for market in subdirs(marketplaces) {
         let direct = market.join("skills").join(name);
@@ -147,7 +192,7 @@ fn skill_name_candidates(skill_name: &str) -> Vec<&str> {
 fn resolve_skill_dir_in(
     skill_name: &str,
     roots: &[PathBuf],
-    marketplaces: &Path,
+    plugins_dir: &Path,
 ) -> Option<PathBuf> {
     let candidates = skill_name_candidates(skill_name);
 
@@ -160,13 +205,18 @@ fn resolve_skill_dir_in(
             }
         }
     }
+    if let Some(dir) = installed_skill_dir(skill_name, plugins_dir) {
+        return Some(dir);
+    }
+    let marketplaces = plugins_dir.join("marketplaces");
+
     candidates
         .iter()
-        .find_map(|name| plugin_skill_dir(name, marketplaces))
+        .find_map(|name| plugin_skill_dir(name, &marketplaces))
 }
 
 fn resolve_skill_dir(skill_name: &str, project_dir: &Path) -> Option<PathBuf> {
-    resolve_skill_dir_in(skill_name, &skill_roots(project_dir), &marketplaces_dir())
+    resolve_skill_dir_in(skill_name, &skill_roots(project_dir), &plugins_dir())
 }
 
 pub fn cmd_hook(rest: &[String]) -> ExitCode {
@@ -370,6 +420,27 @@ mod tests {
         dir.to_path_buf()
     }
 
+    /// Writes an `installed_plugins.json` listing each `<plugin>@<marketplace>`
+    /// key against its install path, in the shape Claude Code writes.
+    fn write_manifest(plugins_dir: &Path, entries: &[(&str, &Path)]) {
+        let plugins: serde_json::Map<String, Value> = entries
+            .iter()
+            .map(|(key, install)| {
+                (
+                    (*key).to_string(),
+                    serde_json::json!([{ "installPath": install.to_string_lossy() }]),
+                )
+            })
+            .collect();
+
+        std::fs::create_dir_all(plugins_dir).unwrap();
+        std::fs::write(
+            plugins_dir.join("installed_plugins.json"),
+            serde_json::to_string(&serde_json::json!({ "version": 2, "plugins": plugins })).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn namespaced_names_try_the_full_name_then_the_last_segment() {
         assert_eq!(skill_name_candidates("verify"), vec!["verify"]);
@@ -465,7 +536,7 @@ mod tests {
         let roots = vec![tmp.join("empty-root")];
 
         assert_eq!(
-            resolve_skill_dir_in("promptsign:verify", &roots, &tmp.join("marketplaces")),
+            resolve_skill_dir_in("promptsign:verify", &roots, &tmp),
             Some(want)
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -484,10 +555,7 @@ mod tests {
         );
         let roots = vec![tmp.join("root")];
 
-        assert_eq!(
-            resolve_skill_dir_in("verify", &roots, &tmp.join("marketplaces")),
-            Some(want)
-        );
+        assert_eq!(resolve_skill_dir_in("verify", &roots, &tmp), Some(want));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -496,10 +564,85 @@ mod tests {
         let tmp = tmp_dir("resolve-miss");
         let roots = vec![tmp.join("root")];
 
-        assert_eq!(
-            resolve_skill_dir_in("nonexistent", &roots, &tmp.join("marketplaces")),
-            None
+        assert_eq!(resolve_skill_dir_in("nonexistent", &roots, &tmp), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_install_manifest_wins_over_the_marketplace_copy() {
+        let tmp = tmp_dir("installed-precedence");
+        let install = tmp.join("cache").join("promptsign").join("0.3.4");
+        let want = make_skill(&install.join("skills").join("verify"));
+
+        make_skill(
+            &tmp.join("marketplaces")
+                .join("promptsign")
+                .join("skills")
+                .join("verify"),
         );
+        write_manifest(&tmp, &[("promptsign@promptsign", &install)]);
+
+        assert_eq!(
+            resolve_skill_dir_in("promptsign:verify", &[], &tmp),
+            Some(want)
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_plugin_with_no_marketplace_checkout_still_resolves() {
+        let tmp = tmp_dir("installed-no-checkout");
+        let install = tmp.join("cache").join("kanban").join("2.3.3");
+        let want = make_skill(&install.join("skills").join("kanban"));
+
+        write_manifest(&tmp, &[("claude-code-kanban@claude-code-kanban", &install)]);
+        assert_eq!(
+            resolve_skill_dir_in("claude-code-kanban:kanban", &[], &tmp),
+            Some(want)
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_manifest_picks_the_installed_version_not_another_cached_one() {
+        let tmp = tmp_dir("installed-version");
+        let stale = tmp.join("cache").join("frontend-design").join("0120fb83da5d");
+        let live = tmp.join("cache").join("frontend-design").join("1dd995193ba2");
+
+        make_skill(&stale.join("skills").join("frontend-design"));
+
+        let want = make_skill(&live.join("skills").join("frontend-design"));
+
+        write_manifest(&tmp, &[("frontend-design@claude-plugins-official", &live)]);
+        assert_eq!(
+            resolve_skill_dir_in("frontend-design:frontend-design", &[], &tmp),
+            Some(want)
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_namespaced_name_prefers_its_own_plugins_install() {
+        let tmp = tmp_dir("installed-namespace");
+        // "aaa" sorts first, so only the namespace can put "zzz" ahead of it.
+        let other = tmp.join("cache").join("aaa").join("1.0.0");
+        let mine = tmp.join("cache").join("zzz").join("1.0.0");
+
+        make_skill(&other.join("skills").join("verify"));
+
+        let want = make_skill(&mine.join("skills").join("verify"));
+
+        write_manifest(&tmp, &[("aaa@market", &other), ("zzz@market", &mine)]);
+        assert_eq!(resolve_skill_dir_in("zzz:verify", &[], &tmp), Some(want));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn an_unreadable_install_manifest_is_a_miss_not_an_error() {
+        let tmp = tmp_dir("installed-broken");
+
+        std::fs::write(tmp.join("installed_plugins.json"), "{not json").unwrap();
+        assert_eq!(installed_skill_dir("verify", &tmp), None);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
