@@ -436,7 +436,8 @@ mod tests {
         std::fs::create_dir_all(plugins_dir).unwrap();
         std::fs::write(
             plugins_dir.join("installed_plugins.json"),
-            serde_json::to_string(&serde_json::json!({ "version": 2, "plugins": plugins })).unwrap(),
+            serde_json::to_string(&serde_json::json!({ "version": 2, "plugins": plugins }))
+                .unwrap(),
         )
         .unwrap();
     }
@@ -606,8 +607,14 @@ mod tests {
     #[test]
     fn the_manifest_picks_the_installed_version_not_another_cached_one() {
         let tmp = tmp_dir("installed-version");
-        let stale = tmp.join("cache").join("frontend-design").join("0120fb83da5d");
-        let live = tmp.join("cache").join("frontend-design").join("1dd995193ba2");
+        let stale = tmp
+            .join("cache")
+            .join("frontend-design")
+            .join("0120fb83da5d");
+        let live = tmp
+            .join("cache")
+            .join("frontend-design")
+            .join("1dd995193ba2");
 
         make_skill(&stale.join("skills").join("frontend-design"));
 
