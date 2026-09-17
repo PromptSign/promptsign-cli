@@ -1,5 +1,7 @@
 # promptsign (CLI)
 
+[![PromptSign](.github/promptsign-badge.svg)](https://github.com/PromptSign/promptsign-cli/releases)
+
 The `promptsign` command signs and verifies AI instruction files, including
 skills, agent definitions, `CLAUDE.md`, and `AGENTS.md`, along with their
 accompanying script payloads.

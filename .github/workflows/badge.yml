@@ -1,0 +1,75 @@
+# Verify a published release with the same PromptSign/promptsign-verify
+# action every consumer is told to use, against a plain GitHub Release rather
+# than the build workspace, and render the README badge from that run.
+#
+# Deliberately its own workflow rather than a job in release.yml: it runs
+# after the release exists, on the `release` event, so re-running it (or
+# backfilling a tag that shipped before this workflow existed, via
+# workflow_dispatch) never risks re-touching the build or re-creating a
+# release that is already published.
+name: badge
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Release tag to verify and badge, e.g. v0.3.6. Only needed to
+          backfill a release that shipped before this workflow existed.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  badge:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # commit the refreshed badge
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - id: tag
+        run: echo "tag=${{ github.event.release.tag_name || inputs.tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: download the published archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${{ steps.tag.outputs.tag }}" --dir dist \
+            --pattern '*.tar.gz' --pattern '*.zip' --pattern '*.psig.json'
+
+      - id: archives
+        run: |
+          {
+            echo 'paths<<PSEOF'
+            ls dist/*.tar.gz dist/*.zip
+            echo PSEOF
+          } >> "$GITHUB_OUTPUT"
+
+      # Pinned by commit SHA, not tag: this job holds contents: write, the
+      # same reason promptsign-plugin's sign workflow pins it this way.
+      - uses: PromptSign/promptsign-verify@ebbc7d69011428db1198cc96b2e1f023bacce181 # v1.0.0
+        with:
+          path: ${{ steps.archives.outputs.paths }}
+          identity: https://github.com/PromptSign/promptsign-cli/.github/workflows/release.yml@refs/tags/*
+          cli-version: ${{ steps.tag.outputs.tag }}
+          badge: .github/promptsign-badge.svg
+
+      - name: keep the badge current
+        run: |
+          set -euo pipefail
+          git add .github/promptsign-badge.svg
+          if git diff --cached --quiet -- .github/promptsign-badge.svg; then
+            echo "badge unchanged"; exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "badge: refresh for ${{ steps.tag.outputs.tag }}"
+          git push origin HEAD:main
