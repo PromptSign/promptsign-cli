@@ -55,7 +55,7 @@ jobs:
 
       # Pinned by commit SHA, not tag: this job holds contents: write, the
       # same reason promptsign-plugin's sign workflow pins it this way.
-      - uses: PromptSign/promptsign-verify@c50f41716b1b4886d2e41cca1ac3cc43bf8ca539 # v1.1.0
+      - uses: PromptSign/promptsign-verify@65c2a57b56df6b4d0d83be30c4476f3621649a98 # v1.1.1
         with:
           path: ${{ steps.archives.outputs.paths }}
           identity: https://github.com/PromptSign/promptsign-cli/.github/workflows/release.yml@refs/tags/*
