@@ -39,10 +39,10 @@ jobs:
           # Both darwin slices build on Apple silicon. The Xcode toolchain is
           # universal, so cross-compiling x86_64 costs nothing — and it avoids
           # depending on an Intel runner image, which is a retiring resource.
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
             foreign: true
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
