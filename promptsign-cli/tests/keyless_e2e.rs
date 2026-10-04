@@ -350,6 +350,35 @@ fn keyless_sign_then_offline_verify() {
 
     assert!(pins.contains(ISSUER), "pin should record issuer: {pins}");
 
+    // A pin from an earlier release tag of the same workflow still passes;
+    // a pin from another workflow is a signer change and hard-fails.
+    let workflow = IDENTITY.split("@refs/").next().unwrap();
+    let repin = |identity: &str| {
+        std::fs::write(home.join("pins.json"), pins.replace(IDENTITY, identity)).unwrap();
+    };
+
+    repin(&format!("{workflow}@refs/tags/v0.9.0"));
+
+    let out = run(&["verify", &skill_str], &work);
+
+    assert!(
+        out.status.success(),
+        "new ref of the pinned workflow must pass: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    repin("https://github.com/acme/skills/.github/workflows/other.yml@refs/heads/main");
+
+    let out = run(&["verify", &skill_str], &work);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "another workflow must fail the pin"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("TOFU pin mismatch"));
+    std::fs::write(home.join("pins.json"), &pins).unwrap();
+
     // tamper -> block
     std::fs::write(skill.join("scripts").join("run.py"), "print(2)\n").unwrap();
 
