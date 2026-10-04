@@ -378,8 +378,8 @@ pub fn trust_show() -> Result<()> {
 // ---- Revocation feed (spec/06) ----
 
 fn load_active_policy() -> Result<promptsign_core::policy::Policy> {
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let (policy, _raw, _src) = promptsign_core::policy::load_policy(None, &cwd)?;
+    // Revocation settings come from the user's policy only (spec/04).
+    let (policy, _raw, _src) = promptsign_core::policy::load_policy(None)?;
 
     Ok(policy)
 }

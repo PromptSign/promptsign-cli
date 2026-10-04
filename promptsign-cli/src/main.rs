@@ -15,7 +15,10 @@ use promptsign_core::bundle::{sign_manifest, write_bundle};
 #[cfg(feature = "local-key")]
 use promptsign_core::keys::{default_identity, default_key_path, keygen, load_private_key};
 use promptsign_core::manifest::{build_manifest, BuildOptions};
-use promptsign_core::policy::{default_policy, load_pins, load_policy, save_pins, Action};
+use promptsign_core::policy::{
+    default_policy, load_pins, load_policy, load_project_policy, save_pins, Action,
+};
+use promptsign_core::trustroot;
 use promptsign_core::util::{promptsign_home, short16, write_private};
 use promptsign_core::verify::{verify_target, VerifyOptions, VerifyResult};
 use promptsign_core::verifytree::verify_tree;
@@ -37,9 +40,11 @@ Usage:
   promptsign sign <dir|file> [--identity-token <jwt>] [--embed] [--name n] [--version v] [--kind k]
   promptsign verify <dir|file> [--policy path] [--json] [--no-pin-updates]
   promptsign verify-tree <root>... [--policy path] [--json] [--quiet] [--no-pin-updates]
-  promptsign policy init [--global] | policy show  (the effective policy and its source)
+  promptsign policy init [--global] | policy show  (yours, plus any project policy, which only tightens it)
   promptsign pin list | pin rm <name>
   promptsign trust fetch [--force] | trust show   (cache Sigstore roots for offline verify)
+  promptsign trust add <name> --ca <pem> | trust add <name> --trusted-root <json> [--yes]
+  promptsign trust list | trust rm <name>          (roots a signature may chain to)
   promptsign revoke fetch | revoke show  (refresh/inspect the cached revocation feed)
   promptsign revoke sign <entries.json> [--out path]   (publish a signed revocation feed)
   promptsign hook [event]     (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
@@ -67,9 +72,11 @@ Usage:
   promptsign keygen [--identity <id>] [--force]
   promptsign verify <dir|file> [--policy path] [--json] [--no-pin-updates]
   promptsign verify-tree <root>... [--policy path] [--json] [--quiet] [--no-pin-updates]
-  promptsign policy init [--global] | policy show  (the effective policy and its source)
+  promptsign policy init [--global] | policy show  (yours, plus any project policy, which only tightens it)
   promptsign pin list | pin rm <name>
   promptsign trust fetch [--force] | trust show   (cache Sigstore roots for offline verify)
+  promptsign trust add <name> --ca <pem> | trust add <name> --trusted-root <json> [--yes]
+  promptsign trust list | trust rm <name>          (roots a signature may chain to)
   promptsign revoke fetch | revoke show  (refresh/inspect the cached revocation feed)
   promptsign revoke sign <entries.json> [--out path]   (publish a signed revocation feed)
   promptsign hook [event]     (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
@@ -166,8 +173,22 @@ pub fn format_result(r: &VerifyResult, color: bool) -> String {
         (Some(i), None) => format!(" signed by {i}"),
         (None, _) => " (unsigned)".to_string(),
     };
+    let mut tags = Vec::new();
+
+    if r.format.as_deref() == Some("oms") {
+        tags.push("OMS".to_string());
+    }
+    if let Some(root) = r.root.as_deref().filter(|r| *r != trustroot::DEFAULT_ROOT) {
+        tags.push(format!("root {root}"));
+    }
+
+    let tags = if tags.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", tags.join(", "))
+    };
     let target = paint(&r.target, color::DIM, color);
-    let mut out = format!("{icon} {}{version}{who} — {target}\n", r.name);
+    let mut out = format!("{icon} {}{version}{who}{tags} — {target}\n", r.name);
 
     for f in &r.findings {
         let codes = match f.level.as_str() {
@@ -536,8 +557,100 @@ fn cmd_trust(rest: &[String]) -> ExitCode {
         Some("show") => keyless_client::trust_show()
             .map(|_| ExitCode::SUCCESS)
             .unwrap_or_else(|e| fail(&e)),
-        _ => fail("trust: expected \"fetch\" or \"show\""),
+        Some("add") => cmd_trust_add(&rest[1..]),
+        Some("list") => cmd_trust_list(),
+        Some("rm") => {
+            let name = rest
+                .get(1)
+                .unwrap_or_else(|| fail("trust rm: missing <name>"));
+
+            trustroot::remove_user_root(name).unwrap_or_else(|e| fail(&e));
+            println!("removed trust root \"{name}\"");
+            ExitCode::SUCCESS
+        }
+        _ => fail("trust: expected \"fetch\", \"show\", \"add\", \"list\" or \"rm\""),
     }
+}
+
+/// Add a root to the user's registry. Trusting a root lets every certificate
+/// it issued sign for you, so show what it is and ask first.
+fn cmd_trust_add(rest: &[String]) -> ExitCode {
+    let p = args::parse(rest, &["ca", "trusted-root"], &["yes"]).unwrap_or_else(|e| fail(&e));
+    let name = p
+        .positionals
+        .first()
+        .unwrap_or_else(|| fail("trust add: missing <name>"));
+    let read =
+        |path: &String| std::fs::read(path).unwrap_or_else(|e| fail(&format!("{path}: {e}")));
+    let candidate = match (p.values.get("ca"), p.values.get("trusted-root")) {
+        (Some(pem), None) => trustroot::Root::ca_only(name, &read(pem)),
+        (None, Some(doc)) => serde_json::from_slice(&read(doc))
+            .map_err(|e| format!("{doc}: {e}"))
+            .and_then(|v| trustroot::Root::from_trusted_root(name, &v)),
+        _ => fail("trust add: give exactly one of --ca <pem> or --trusted-root <json>"),
+    }
+    .unwrap_or_else(|e| fail(&e));
+    let kind = if candidate.is_ca_only() {
+        "certificate (no transparency log; checked at the current time)"
+    } else {
+        "keyless (CA plus transparency log)"
+    };
+
+    println!("root:        {}", candidate.subject);
+    println!("fingerprint: sha256:{}", candidate.fingerprint);
+    println!("kind:        {kind}");
+
+    if !p.flags.contains("yes") {
+        if !std::io::stdin().is_terminal() {
+            fail("trust add: confirm with --yes when not running interactively");
+        }
+        print!("Trust signatures that chain to this root as \"{name}\"? [y/N] ");
+
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let mut answer = String::new();
+
+        std::io::stdin().read_line(&mut answer).unwrap_or_default();
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            fail("trust add: not added");
+        }
+    }
+
+    let added = match (p.values.get("ca"), p.values.get("trusted-root")) {
+        (Some(pem), _) => trustroot::add_user_ca_root(name, &read(pem)),
+        (_, Some(doc)) => serde_json::from_slice(&read(doc))
+            .map_err(|e| format!("{doc}: {e}"))
+            .and_then(|v| trustroot::add_user_trusted_root(name, &v)),
+        _ => unreachable!(),
+    }
+    .unwrap_or_else(|e| fail(&e));
+
+    println!(
+        "added trust root \"{}\" to {}",
+        added.name,
+        trustroot::user_trust_dir().join("roots").display()
+    );
+    ExitCode::SUCCESS
+}
+
+fn cmd_trust_list() -> ExitCode {
+    let roots = trustroot::load_registry().unwrap_or_else(|e| fail(&e));
+
+    if roots.is_empty() {
+        println!("no trust roots: run \"promptsign trust fetch\"");
+    }
+    for r in &roots {
+        let kind = if r.is_ca_only() {
+            "certificate"
+        } else {
+            "keyless"
+        };
+
+        println!(
+            "{:<20} {:<12} sha256:{}  {}",
+            r.name, kind, r.fingerprint, r.subject
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 fn cmd_revoke(rest: &[String]) -> ExitCode {
@@ -661,14 +774,25 @@ fn cmd_policy(rest: &[String]) -> ExitCode {
 
             written.unwrap_or_else(|e| fail(&e.to_string()));
             println!("wrote {}", path.display());
+            if !global {
+                println!(
+                    "a project policy adds requirements on top of each user's own policy; \
+                     it cannot relax it or trust more signers"
+                );
+            }
             ExitCode::SUCCESS
         }
         Some("show") => {
             let cwd = std::env::current_dir().unwrap_or_else(|e| fail(&e.to_string()));
-            let (_policy, raw, source) = load_policy(None, &cwd).unwrap_or_else(|e| fail(&e));
+            let (_policy, raw, source) = load_policy(None).unwrap_or_else(|e| fail(&e));
 
             println!("# source: {source}");
             println!("{}", serde_json::to_string_pretty(&raw).unwrap());
+            if let Some((_p, raw, source)) = load_project_policy(&cwd).unwrap_or_else(|e| fail(&e))
+            {
+                println!("# project policy (tighten only): {source}");
+                println!("{}", serde_json::to_string_pretty(&raw).unwrap());
+            }
             ExitCode::SUCCESS
         }
         _ => fail("policy: expected \"init\" or \"show\""),
@@ -766,6 +890,8 @@ mod report_tests {
             issuer: None,
             keyid: None,
             integrated_time: None,
+            format: Some("promptsign".to_string()),
+            root: None,
             signed: true,
             action: Action::Fail,
             findings,

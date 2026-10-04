@@ -27,3 +27,6 @@
 # Lockfiles: text, but collapsed in GitHub diffs and review.
 Cargo.lock       linguist-generated
 package-lock.json linguist-generated
+
+# OMS fixtures hash raw bytes: store them exactly as signed.
+promptsign-cli/tests/fixtures/oms/** -text
