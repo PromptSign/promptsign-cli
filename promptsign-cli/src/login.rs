@@ -267,10 +267,7 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String>
         }
         match (params.get("code"), params.get("state")) {
             (Some(code), Some(state)) if state == expected_state => {
-                respond(
-                    &mut stream,
-                    "Login complete \u{2014} return to your terminal.",
-                );
+                respond(&mut stream, "Login complete. Return to your terminal.");
                 return Ok(code.clone());
             }
             (Some(_), Some(_)) => {
