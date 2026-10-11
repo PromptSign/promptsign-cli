@@ -8,10 +8,10 @@
 //                       failures are reported into session context (non-blocking
 //                       unless PROMPTSIGN_STRICT=1).
 //   PreToolUse(Skill) — locate the invoked skill's directory and verify it,
-//                       through the nearest enclosing bundle when the skill
-//                       was signed as part of a whole plugin; exit code 2
-//                       blocks the tool call and feeds the reason back to
-//                       the model.
+//                       through the nearest enclosing bundle (PromptSign or
+//                       OMS) when the skill was signed as part of a whole
+//                       plugin; exit code 2 blocks the tool call and feeds
+//                       the reason back to the model.
 //
 // Config via env:
 //   PROMPTSIGN_SKILL_ROOTS — extra skill roots, path-delimiter separated
@@ -20,7 +20,9 @@
 
 use crate::{format_result, format_tree_report};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
-use promptsign_core::manifest::{walk_tree, Manifest};
+use promptsign_core::canonicalize::is_markdown;
+use promptsign_core::manifest::{role_for, walk_tree, Manifest, CONTEXT_INJECTED};
+use promptsign_core::oms;
 use promptsign_core::policy::{Action, Finding};
 use promptsign_core::util::home_dir;
 use promptsign_core::verify::{verify_target, VerifyOptions};
@@ -247,8 +249,10 @@ fn resolve_skill_dir(skill_name: &str, project_dir: &Path) -> Option<SkillDir> {
     resolve_skill_dir_in(skill_name, &skill_roots(project_dir), &plugins_dir())
 }
 
+/// A PromptSign bundle, or an OpenSSF Model Signing (OMS) signature, which
+/// OMS writes into the directory it signs.
 fn has_bundle(dir: &Path) -> bool {
-    dir.join(".promptsign").join("bundle.json").is_file()
+    dir.join(".promptsign").join("bundle.json").is_file() || oms::signature_file(dir).is_some()
 }
 
 /// The directory whose signature covers a skill: the skill's own bundle when
@@ -276,12 +280,52 @@ fn claimed_manifest(root: &Path) -> Option<Manifest> {
     serde_json::from_slice(&payload).ok()
 }
 
-/// Files under a skill that the enclosing bundle at `root` does not list, in
-/// the wording check_integrity uses. verify_target(root) already reports these
-/// for an ordinary skills/<name>/ path. Checking again from the skill's side
-/// covers a skill under a directory the root's walk skips, and makes a skill
-/// planted into a signed plugin fail instead of reading as unsigned.
-fn unlisted_in_skill(root: &Path, dir: &Path) -> Vec<String> {
+/// The files an OMS signature at `root` claims, from its in-toto Statement's
+/// predicate.resources. Read without checking the signature, like
+/// claimed_manifest.
+fn claimed_oms_resources(root: &Path) -> Option<HashSet<String>> {
+    let raw = std::fs::read(oms::signature_file(root)?).ok()?;
+    let bundle: Value = serde_json::from_slice(&raw).ok()?;
+    let payload_type = bundle.pointer("/dsseEnvelope/payloadType")?.as_str()?;
+    let payload = bundle.pointer("/dsseEnvelope/payload")?.as_str()?;
+    let payload = BASE64_STANDARD.decode(payload).ok()?;
+    let statement = oms::parse_statement(payload_type, &payload).ok()?;
+
+    Some(
+        statement
+            .resources
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect(),
+    )
+}
+
+/// The core's OMS coverage rule (oms::check_dir): a file the signature leaves
+/// out fails when an agent would read or run it (an entrypoint, an executable,
+/// a context-injected file, Markdown) and only warns otherwise. `rel` is
+/// relative to the signed directory, as in the core.
+fn uncovered_fails(rel: &str) -> bool {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+
+    matches!(role_for(rel), "entrypoint" | "executable")
+        || CONTEXT_INJECTED.contains(&base)
+        || is_markdown(rel)
+}
+
+fn error(message: String) -> Finding {
+    Finding {
+        level: "error".to_string(),
+        message,
+    }
+}
+
+/// Files under a skill that the enclosing bundle at `root` does not list, as
+/// findings in the wording and level the core's own check uses for that
+/// format. verify_target(root) already reports these for an ordinary
+/// skills/<name>/ path. Checking again from the skill's side covers a skill
+/// under a directory the root's walk skips, and makes a skill planted into a
+/// signed plugin fail instead of reading as unsigned.
+fn unlisted_in_skill(root: &Path, dir: &Path) -> Vec<Finding> {
     if root == dir {
         return Vec::new();
     }
@@ -294,27 +338,61 @@ fn unlisted_in_skill(root: &Path, dir: &Path) -> Vec<String> {
             .join("/"),
         Err(_) => return Vec::new(),
     };
-    let listed: HashSet<String> = claimed_manifest(root)
-        .map(|m| m.files.into_iter().map(|f| f.path).collect())
-        .unwrap_or_default();
+    // The core's precedence: a PromptSign bundle first, then an OMS signature.
+    let is_oms = !root.join(".promptsign").join("bundle.json").is_file();
+    let listed: HashSet<String> = if is_oms {
+        claimed_oms_resources(root).unwrap_or_default()
+    } else {
+        claimed_manifest(root)
+            .map(|m| m.files.into_iter().map(|f| f.path).collect())
+            .unwrap_or_default()
+    };
     let tree = match walk_tree(dir) {
         Ok(tree) => tree,
-        Err(e) => return vec![format!("{prefix}: {e}")],
+        Err(e) => return vec![error(format!("{prefix}: {e}"))],
     };
-    let mut problems: Vec<String> = tree
+    let mut problems: Vec<Finding> = tree
         .files
         .iter()
         .map(|f| format!("{prefix}/{f}"))
         .filter(|path| !listed.contains(path))
-        .map(|path| format!("unlisted file present: {path}"))
+        .map(|path| {
+            if !is_oms {
+                return error(format!("unlisted file present: {path}"));
+            }
+
+            let level = if uncovered_fails(&path) {
+                "error"
+            } else {
+                "warn"
+            };
+
+            Finding {
+                level: level.to_string(),
+                message: format!("uncovered: {path} is not covered by the signature"),
+            }
+        })
         .collect();
 
     problems.extend(
         tree.links
             .iter()
-            .map(|link| format!("symlink present: {prefix}/{link}")),
+            .map(|link| error(format!("symlink present: {prefix}/{link}"))),
     );
     problems
+}
+
+/// Raises `action` to at least what a finding of `level` implies, never lowers it.
+fn escalate(action: &mut Action, level: &str) {
+    let to = match level {
+        "error" => Action::Fail,
+        "warn" => Action::Warn,
+        _ => Action::Pass,
+    };
+
+    if to > *action {
+        *action = to;
+    }
 }
 
 pub fn cmd_hook(rest: &[String]) -> ExitCode {
@@ -439,14 +517,13 @@ fn pre_tool_use(input: &Value, project_dir: &Path) -> ExitCode {
 
     let root = bundle_root(&skill);
     let verdict = verify_target(&root.to_string_lossy(), &VerifyOptions::default()).map(|mut r| {
+        // A finding the core already made has already set the action.
         for problem in unlisted_in_skill(&root, &skill.dir) {
-            if !r.findings.iter().any(|f| f.message == problem) {
-                r.findings.push(Finding {
-                    level: "error".to_string(),
-                    message: problem,
-                });
+            if r.findings.iter().any(|f| f.message == problem.message) {
+                continue;
             }
-            r.action = Action::Fail;
+            escalate(&mut r.action, &problem.level);
+            r.findings.push(problem);
         }
         r
     });
@@ -797,6 +874,10 @@ mod tests {
         write_bundle(root, &bundle).unwrap();
     }
 
+    fn messages(findings: Vec<Finding>) -> Vec<String> {
+        findings.into_iter().map(|f| f.message).collect()
+    }
+
     /// A plugin signed at its root, as an author who signs the whole repository
     /// or its plugin/ directory ships it, with one skill under skills/.
     fn root_signed_plugin(tmp: &Path) -> SkillDir {
@@ -863,7 +944,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            unlisted_in_skill(&bundle_root(&skill), &skill.dir),
+            messages(unlisted_in_skill(&bundle_root(&skill), &skill.dir)),
             vec!["unlisted file present: skills/hello/evil.sh".to_string()]
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -881,7 +962,7 @@ mod tests {
 
         assert_eq!(root, signed.boundary);
         assert_eq!(
-            unlisted_in_skill(&root, &skill.dir),
+            messages(unlisted_in_skill(&root, &skill.dir)),
             vec!["unlisted file present: skills/planted/SKILL.md".to_string()]
         );
         let _ = std::fs::remove_dir_all(&tmp);

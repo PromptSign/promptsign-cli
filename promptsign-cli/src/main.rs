@@ -171,6 +171,9 @@ pub fn format_result(r: &VerifyResult, color: bool) -> String {
     let who = match (&r.identity, &r.issuer) {
         (Some(i), Some(iss)) => format!(" signed by {i} via {iss}"),
         (Some(i), None) => format!(" signed by {i}"),
+        // A signature is present but did not verify, so the result is signed
+        // with no signer to name.
+        (None, _) if r.signed => " (signature did not verify)".to_string(),
         (None, _) => " (unsigned)".to_string(),
     };
     let mut tags = Vec::new();
