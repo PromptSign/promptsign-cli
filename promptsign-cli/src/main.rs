@@ -9,6 +9,7 @@ mod hook;
 mod keyless_client;
 mod login;
 mod proxy;
+mod trust_bundles;
 
 #[cfg(feature = "local-key")]
 use promptsign_core::bundle::{sign_manifest, write_bundle};
@@ -18,10 +19,10 @@ use promptsign_core::manifest::{build_manifest, BuildOptions};
 use promptsign_core::policy::{
     default_policy, load_pins, load_policy, load_project_policy, save_pins, Action,
 };
-use promptsign_core::trustroot;
 use promptsign_core::util::{promptsign_home, short16, write_private};
 use promptsign_core::verify::{verify_target, VerifyOptions, VerifyResult};
 use promptsign_core::verifytree::verify_tree;
+use promptsign_core::{trustbundle, trustroot};
 use std::fmt::Write as _;
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
@@ -42,8 +43,9 @@ Usage:
   promptsign verify-tree <root>... [--policy path] [--json] [--quiet] [--no-pin-updates]
   promptsign policy init [--global] | policy show  (yours, plus any project policy, which only tightens it)
   promptsign pin list | pin rm <name>
-  promptsign trust fetch [--force] | trust show   (cache Sigstore roots for offline verify)
+  promptsign trust fetch [--force] [<bundle>] | trust show   (refresh Sigstore roots and trust bundles)
   promptsign trust add <name> --ca <pem> | trust add <name> --trusted-root <json> [--yes]
+  promptsign trust add <name> <url|file> [--signer <glob>] [--yes]   (an organization's trust bundle)
   promptsign trust list | trust rm <name>          (roots a signature may chain to)
   promptsign revoke fetch | revoke show  (refresh/inspect the cached revocation feed)
   promptsign revoke sign <entries.json> [--out path]   (publish a signed revocation feed)
@@ -506,8 +508,9 @@ fn cmd_sign(rest: &[String]) -> ExitCode {
     }
 
     // Default: keyless. Fail before any network call if offline verification
-    // could not succeed anyway — the self-check needs the cached trust root.
-    promptsign_core::keyless::load_trust_root().unwrap_or_else(|e| fail(&e));
+    // could not succeed anyway: the self-check needs a keyless root, the
+    // built-in one or one the user trusts for their own Fulcio (spec/07).
+    keyless_client::require_keyless_root().unwrap_or_else(|e| fail(&e));
 
     let payload = serde_json::to_vec(&manifest).unwrap_or_else(|e| fail(&e.to_string()));
     let outcome = keyless_client::keyless_sign(
@@ -553,7 +556,15 @@ fn cmd_trust(rest: &[String]) -> ExitCode {
         Some("fetch") => {
             let p = args::parse(&rest[1..], &[], &["force"]).unwrap_or_else(|e| fail(&e));
 
-            keyless_client::trust_fetch(p.flags.contains("force"))
+            // A name refreshes that bundle alone. No name refreshes the built-in
+            // root, then every installed bundle (spec/07 §2.2).
+            if let Some(name) = p.positionals.first() {
+                return trust_bundles::fetch(Some(name))
+                    .map(|_| ExitCode::SUCCESS)
+                    .unwrap_or_else(|e| fail(&e));
+            }
+            keyless_client::trust_fetch(p.flags.contains("force")).unwrap_or_else(|e| fail(&e));
+            trust_bundles::fetch(None)
                 .map(|_| ExitCode::SUCCESS)
                 .unwrap_or_else(|e| fail(&e))
         }
@@ -567,6 +578,16 @@ fn cmd_trust(rest: &[String]) -> ExitCode {
                 .get(1)
                 .unwrap_or_else(|| fail("trust rm: missing <name>"));
 
+            if trustroot::user_trust_dir()
+                .join("bundles")
+                .join(name)
+                .is_dir()
+            {
+                trustbundle::remove_trust_bundle(&trustroot::user_trust_dir(), name)
+                    .unwrap_or_else(|e| fail(&e));
+                println!("removed trust bundle \"{name}\" and its roots");
+                return ExitCode::SUCCESS;
+            }
             trustroot::remove_user_root(name).unwrap_or_else(|e| fail(&e));
             println!("removed trust root \"{name}\"");
             ExitCode::SUCCESS
@@ -578,11 +599,26 @@ fn cmd_trust(rest: &[String]) -> ExitCode {
 /// Add a root to the user's registry. Trusting a root lets every certificate
 /// it issued sign for you, so show what it is and ask first.
 fn cmd_trust_add(rest: &[String]) -> ExitCode {
-    let p = args::parse(rest, &["ca", "trusted-root"], &["yes"]).unwrap_or_else(|e| fail(&e));
+    let p =
+        args::parse(rest, &["ca", "trusted-root", "signer"], &["yes"]).unwrap_or_else(|e| fail(&e));
     let name = p
         .positionals
         .first()
         .unwrap_or_else(|| fail("trust add: missing <name>"));
+
+    if let Some(src) = p.positionals.get(1) {
+        if p.values.contains_key("ca") || p.values.contains_key("trusted-root") {
+            fail("trust add: give a bundle <url|file>, or --ca / --trusted-root, not both");
+        }
+        return trust_bundles::add(
+            name,
+            src,
+            p.values.get("signer").map(String::as_str),
+            p.flags.contains("yes"),
+        )
+        .map(|_| ExitCode::SUCCESS)
+        .unwrap_or_else(|e| fail(&e));
+    }
     let read =
         |path: &String| std::fs::read(path).unwrap_or_else(|e| fail(&format!("{path}: {e}")));
     let candidate = match (p.values.get("ca"), p.values.get("trusted-root")) {
@@ -590,7 +626,9 @@ fn cmd_trust_add(rest: &[String]) -> ExitCode {
         (None, Some(doc)) => serde_json::from_slice(&read(doc))
             .map_err(|e| format!("{doc}: {e}"))
             .and_then(|v| trustroot::Root::from_trusted_root(name, &v)),
-        _ => fail("trust add: give exactly one of --ca <pem> or --trusted-root <json>"),
+        _ => fail(
+            "trust add: give a bundle <url|file>, or exactly one of --ca <pem> or --trusted-root <json>",
+        ),
     }
     .unwrap_or_else(|e| fail(&e));
     let kind = if candidate.is_ca_only() {
@@ -603,20 +641,12 @@ fn cmd_trust_add(rest: &[String]) -> ExitCode {
     println!("fingerprint: sha256:{}", candidate.fingerprint);
     println!("kind:        {kind}");
 
-    if !p.flags.contains("yes") {
-        if !std::io::stdin().is_terminal() {
-            fail("trust add: confirm with --yes when not running interactively");
-        }
-        print!("Trust signatures that chain to this root as \"{name}\"? [y/N] ");
-
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        let mut answer = String::new();
-
-        std::io::stdin().read_line(&mut answer).unwrap_or_default();
-        if !matches!(answer.trim(), "y" | "Y" | "yes") {
-            fail("trust add: not added");
-        }
-    }
+    trust_bundles::confirm(
+        &format!("Trust signatures that chain to this root as \"{name}\"?"),
+        p.flags.contains("yes"),
+        "trust add",
+    )
+    .unwrap_or_else(|e| fail(&e));
 
     let added = match (p.values.get("ca"), p.values.get("trusted-root")) {
         (Some(pem), _) => trustroot::add_user_ca_root(name, &read(pem)),
@@ -637,6 +667,11 @@ fn cmd_trust_add(rest: &[String]) -> ExitCode {
 
 fn cmd_trust_list() -> ExitCode {
     let roots = trustroot::load_registry().unwrap_or_else(|e| fail(&e));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let bundles = trustbundle::installed_user_bundles(now).unwrap_or_else(|e| fail(&e));
 
     if roots.is_empty() {
         println!("no trust roots: run \"promptsign trust fetch\"");
@@ -647,9 +682,27 @@ fn cmd_trust_list() -> ExitCode {
         } else {
             "keyless"
         };
+        let from = r
+            .name
+            .split_once('/')
+            .and_then(|(b, _)| bundles.iter().find(|i| i.bundle.name == b))
+            .map(|i| {
+                format!(
+                    "  (bundle {} v{}, expires {}{})",
+                    i.bundle.name,
+                    i.bundle.version,
+                    promptsign_core::util::format_iso8601(i.bundle.expires),
+                    if i.stale {
+                        ", STALE: run promptsign trust fetch"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .unwrap_or_default();
 
         println!(
-            "{:<20} {:<12} sha256:{}  {}",
+            "{:<20} {:<12} sha256:{}  {}{from}",
             r.name, kind, r.fingerprint, r.subject
         );
     }

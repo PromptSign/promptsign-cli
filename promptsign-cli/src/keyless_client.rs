@@ -36,6 +36,19 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
+/// A GET of at most 4 MiB, for documents such as trust bundles.
+pub(crate) fn http_get(url: &str) -> Result<Vec<u8>> {
+    let resp = agent().get(url).call().map_err(|e| http_err(url, e))?;
+    let mut body = Vec::new();
+
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(resp.into_reader(), 4 << 20),
+        &mut body,
+    )
+    .map_err(|e| format!("{url}: {e}"))?;
+    Ok(body)
+}
+
 fn http_err(context: &str, e: ureq::Error) -> String {
     match e {
         ureq::Error::Status(code, resp) => {
@@ -233,6 +246,22 @@ pub fn keyless_sign(
         issuer,
         log_index,
     })
+}
+
+/// A keyless root to verify against: the built-in one or one the user added,
+/// such as their organization's own Fulcio and Rekor (spec/07). Signing checks
+/// this before any network call, since its self-check could not pass without.
+pub fn require_keyless_root() -> Result<()> {
+    if promptsign_core::trustroot::load_registry()?
+        .iter()
+        .any(|r| !r.is_ca_only())
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "no Sigstore trust root in {}: run \"promptsign trust fetch\" first",
+        trust_dir().display()
+    ))
 }
 
 /// Decoded DER of every PEM block carrying this label. Comparing decoded bytes
@@ -480,7 +509,7 @@ pub fn revoke_sign(
     let payload = serde_json::to_vec(&feed).map_err(|e| e.to_string())?;
 
     // The feed must itself verify offline before we publish it (like `sign`).
-    promptsign_core::keyless::load_trust_root()?;
+    require_keyless_root()?;
 
     let outcome = keyless_sign(&payload, REVOCATION_PAYLOAD_TYPE, token_flag)?;
 

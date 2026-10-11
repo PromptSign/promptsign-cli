@@ -231,6 +231,22 @@ invalidates every signature made under it. Fulcio and Rekor serve only what is
 stops and tells you how to append instead. `--force` overwrites anyway and
 accepts that loss.
 
+An organization that runs its own Sigstore, or signs with its own CA, publishes
+its roots as a trust bundle (spec/07): a `trust-bundle.json` signed with plain
+`promptsign sign`, served with its `.psig.json` beside it.
+
+```bash
+promptsign trust add acme https://trust.acme.example/trust-bundle.json \n  --signer 'https://github.com/acme/trust/*'   # shows signer and roots, asks first
+promptsign trust list                          # acme/<root> entries, version, expiry
+promptsign trust fetch                         # refreshes the Sigstore roots and every bundle
+promptsign trust rm acme
+```
+
+After the first install, `trust fetch` accepts a new version only when a signer
+the installed version lists signed it and its version number is higher, so a
+replayed old bundle is refused. A bundle past its expiry still verifies, with a
+warning, or a failure under `"on_trust_bundle_stale": "fail"` in your policy.
+
 Keep the `.psig.json` sidecar next to the archive under its original name; that
 pairing is how `verify` finds it. Bare `promptsign verify` pins the signer on
 first use (TOFU) and holds across releases, since archive names carry the
