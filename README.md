@@ -118,6 +118,9 @@ cargo test --features local-key     # Covers local-key code paths
 ### Component Coverage
 * **`hook.rs`**: Unit tests covering skill resolution, including the namespaced
 names and the marketplace layouts a Claude Code plugin installs into.
+* **`hook/codex.rs`**: Unit tests covering Codex's AGENTS.md chain, skill roots,
+shell-command paths and `$name` mentions; `tests/hook_codex_e2e.rs` tests the
+hook for Codex (`promptsign hook --codex`).
 * **`keyless_client.rs`**: Unit tests covering the `trust fetch` guard that
 refuses to discard cached trust material.
 * **`login.rs`**: Unit tests covering the browser login flow.

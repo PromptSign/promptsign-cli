@@ -49,7 +49,7 @@ Usage:
   promptsign trust list | trust rm <name>          (roots a signature may chain to)
   promptsign revoke fetch | revoke show  (refresh/inspect the cached revocation feed)
   promptsign revoke sign <entries.json> [--out path]   (publish a signed revocation feed)
-  promptsign hook [event]     (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
+  promptsign hook [event] [--codex]   (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
   promptsign proxy [--host h] [--port p] [--allow-origin o] [--allow-host h]
                               (local CORS proxy for in-browser keyless signing)
 
@@ -81,7 +81,7 @@ Usage:
   promptsign trust list | trust rm <name>          (roots a signature may chain to)
   promptsign revoke fetch | revoke show  (refresh/inspect the cached revocation feed)
   promptsign revoke sign <entries.json> [--out path]   (publish a signed revocation feed)
-  promptsign hook [event]     (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
+  promptsign hook [event] [--codex]   (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
   promptsign proxy [--host h] [--port p] [--allow-origin o] [--allow-host h]
                               (local CORS proxy for in-browser keyless signing)
 

@@ -13,6 +13,9 @@
 //                       plugin; exit code 2 blocks the tool call and feeds
 //                       the reason back to the model.
 //
+// Codex loads instructions differently and is handled in hook/codex.rs,
+// selected by `--codex` or by the turn_id only Codex sends.
+//
 // Config via env:
 //   PROMPTSIGN_SKILL_ROOTS — extra skill roots, path-delimiter separated
 //   PROMPTSIGN_STRICT=1    — fail closed: unknown/unresolvable skills are
@@ -32,6 +35,8 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+mod codex;
 
 const PATH_DELIMITER: char = if cfg!(windows) { ';' } else { ':' };
 
@@ -53,14 +58,20 @@ fn block(reason: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-fn skill_roots(project_dir: &Path) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-
-    if let Ok(extra) = std::env::var("PROMPTSIGN_SKILL_ROOTS") {
-        for p in extra.split(PATH_DELIMITER).filter(|p| !p.is_empty()) {
-            roots.push(PathBuf::from(p));
-        }
+fn extra_skill_roots() -> Vec<PathBuf> {
+    match std::env::var("PROMPTSIGN_SKILL_ROOTS") {
+        Ok(extra) => extra
+            .split(PATH_DELIMITER)
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .collect(),
+        Err(_) => Vec::new(),
     }
+}
+
+fn skill_roots(project_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = extra_skill_roots();
+
     roots.push(project_dir.join(".claude").join("skills"));
     // OpenClaw skill roots, in its own precedence order (workspace > project
     // agent > personal agent > managed). ClawPilot desktop apps share these.
@@ -397,11 +408,14 @@ fn escalate(action: &mut Action, level: &str) {
 
 pub fn cmd_hook(rest: &[String]) -> ExitCode {
     let input = read_stdin_json();
+    // Only Codex sends turn_id. Its SessionStart event carries nothing that
+    // tells it apart from Claude Code's, hence the flag.
+    let codex = rest.iter().any(|a| a == "--codex") || input.get("turn_id").is_some();
     let event = input
         .get("hook_event_name")
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .or_else(|| rest.first().cloned());
+        .or_else(|| rest.iter().find(|a| !a.starts_with("--")).cloned());
     let project_dir = input
         .get("cwd")
         .and_then(|v| v.as_str())
@@ -411,6 +425,9 @@ pub fn cmd_hook(rest: &[String]) -> ExitCode {
         .unwrap_or_else(|| PathBuf::from("."));
 
     match event.as_deref() {
+        Some("PreToolUse") if codex => codex::pre_tool_use(&input, &project_dir),
+        Some("UserPromptSubmit") if codex => codex::user_prompt_submit(&input, &project_dir),
+        Some("SessionStart") if codex => codex::session_start(&project_dir),
         Some("PreToolUse") => pre_tool_use(&input, &project_dir),
         Some("SessionStart") => session_start(&project_dir),
         Some("openclaw-install-policy") => openclaw_install_policy(&input),
@@ -515,7 +532,16 @@ fn pre_tool_use(input: &Value, project_dir: &Path) -> ExitCode {
         }
     };
 
-    let root = bundle_root(&skill);
+    match skill_failure(&skill_name, &skill) {
+        Some(reason) => block(&reason),
+        None => ExitCode::SUCCESS,
+    }
+}
+
+/// Verifies a located skill through the signature that covers it. Returns the
+/// reason to block with, or None when the skill may run.
+fn skill_failure(skill_name: &str, skill: &SkillDir) -> Option<String> {
+    let root = bundle_root(skill);
     let verdict = verify_target(&root.to_string_lossy(), &VerifyOptions::default()).map(|mut r| {
         // A finding the core already made has already set the action.
         for problem in unlisted_in_skill(&root, &skill.dir) {
@@ -534,19 +560,14 @@ fn pre_tool_use(input: &Value, project_dir: &Path) -> ExitCode {
     };
 
     match verdict {
-        Ok(r) if r.action == Action::Fail => block(&format!(
+        Ok(r) if r.action == Action::Fail => Some(format!(
             "signature verification FAILED for skill \"{skill_name}\" at {}{signed_as} — blocking execution.\n{}",
             skill.dir.display(),
             format_result(&r, false).trim()
         )),
-        Ok(_) => ExitCode::SUCCESS,
-        Err(e) => {
-            // verifier itself broke: fail closed only in strict mode
-            if strict() {
-                return block(&format!("verifier error for \"{skill_name}\": {e}"));
-            }
-            ExitCode::SUCCESS
-        }
+        Ok(_) => None,
+        // verifier itself broke: fail closed only in strict mode
+        Err(e) => strict().then(|| format!("verifier error for \"{skill_name}\": {e}")),
     }
 }
 
