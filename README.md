@@ -86,7 +86,10 @@ reproducible.
 All network access in PromptSign is in this crate, and that is an architectural
 invariant rather than an accident:
 
-- `keyless_client.rs`: Fulcio certificate request, Rekor log submission
+- `keyless_client.rs`: Fulcio certificate request, RFC 3161 timestamps, Rekor
+  v1 and v2 log submission
+- `tuf.rs`: the TUF client `trust fetch` uses for Sigstore's trusted_root.json
+  and signing config
 - `login.rs`: interactive browser sign-in, token cache
 - `proxy.rs`: local CORS proxy for in-browser signing
 - `trust fetch` / `revoke fetch`: one-time and opportunistic cache refreshes
@@ -114,6 +117,15 @@ cargo test --features local-key     # Covers local-key code paths
 * **Environment Overrides**: Sigstore endpoints are redirected using:
   * `PROMPTSIGN_FULCIO_URL`
   * `PROMPTSIGN_REKOR_URL`
+  * `PROMPTSIGN_TSA_URL`
+  * `PROMPTSIGN_SIGNING_CONFIG`, a Sigstore signing config file that picks all
+    three (spec/05 §6)
+  * `PROMPTSIGN_TUF_URL` and `PROMPTSIGN_TUF_ROOT`, the TUF repository
+    `trust fetch` reads and the root it starts from
+
+`tests/keyless_v2_e2e.rs` signs through a mock Rekor v2 log and timestamp
+authority, and `tests/tuf_e2e.rs` runs `trust fetch` against a mock TUF
+repository (root rotation, tampered target, rollback).
 
 ### Component Coverage
 * **`hook.rs`**: Unit tests covering skill resolution, including the namespaced
@@ -123,6 +135,10 @@ shell-command paths and `$name` mentions; `tests/hook_codex_e2e.rs` tests the
 hook for Codex (`promptsign hook --codex`).
 * **`keyless_client.rs`**: Unit tests covering the `trust fetch` guard that
 refuses to discard cached trust material.
+* **`signing_config.rs`**: Unit tests covering service selection by
+validity window, API version and selector.
+* **`tuf.rs`**: Unit tests covering canonical JSON and the embedded Sigstore
+root.
 * **`login.rs`**: Unit tests covering the browser login flow.
 * **`proxy.rs`**: Unit tests covering the CORS proxy functionality.
 
@@ -226,7 +242,9 @@ contains one block per transparency log. A signature is checked against the CA
 that issued its certificate and the log that witnessed its entry, with each
 selected by name. `promptsign trust show` prints the cache location and every
 pinned log id, so what is trusted after an append is visible rather than
-assumed.
+assumed. `trust fetch` also takes Sigstore's `trusted_root.json` (the Rekor v2
+log and the timestamp authority) and signing config from Sigstore's TUF
+repository, and checks both against the TUF root built into the binary.
 
 When Sigstore rotates, the retired material has to stay because dropping it
 invalidates every signature made under it. Fulcio and Rekor serve only what is

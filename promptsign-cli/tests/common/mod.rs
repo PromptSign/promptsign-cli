@@ -1,10 +1,13 @@
 // A mock Sigstore deployment on localhost for end-to-end tests: Fulcio
 // (`/api/v2/signingCert`, issuing real certificates for the CLI's ephemeral
 // key under one fixed identity) and Rekor (`/api/v1/log/entries`, returning a
-// real signed entry timestamp), plus `/files/<name>`, which serves a directory
+// real signed entry timestamp), the two keys `trust fetch` reads from them,
+// plus `/files/<name>`, which serves a directory
 // byte for byte so `trust add <url>` and `trust fetch` run over real HTTP.
 
 #![allow(dead_code)]
+
+pub mod v2;
 
 use base64::prelude::{Engine as _, BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use p256::ecdsa::signature::hazmat::PrehashSigner;
@@ -157,6 +160,7 @@ impl Deployment {
         let served = files.to_path_buf();
         let identity = identity.to_string();
         let chain_ca = ca_pem.clone();
+        let served_rekor = rekor_pem.clone();
 
         std::fs::create_dir_all(files).unwrap();
         std::thread::spawn(move || {
@@ -250,6 +254,10 @@ impl Deployment {
                         "201 Created",
                         &serde_json::to_vec(&out).unwrap(),
                     );
+                } else if line.contains("/api/v1/rootCert") {
+                    respond(&mut stream, "200 OK", chain_ca.as_bytes());
+                } else if line.contains("/api/v1/log/publicKey") {
+                    respond(&mut stream, "200 OK", served_rekor.as_bytes());
                 } else if let Some(name) = line
                     .split_whitespace()
                     .nth(1)

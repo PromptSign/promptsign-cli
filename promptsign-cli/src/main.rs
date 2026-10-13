@@ -9,7 +9,9 @@ mod hook;
 mod keyless_client;
 mod login;
 mod proxy;
+mod signing_config;
 mod trust_bundles;
+mod tuf;
 
 #[cfg(feature = "local-key")]
 use promptsign_core::bundle::{sign_manifest, write_bundle};

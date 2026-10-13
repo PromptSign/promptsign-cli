@@ -14,22 +14,23 @@ use promptsign_core::revocation::{
     feed_path, load_cached_feed, verify_feed, RevocationEntry, RevocationFeed,
     REVOCATION_PAYLOAD_TYPE, REVOCATION_SCHEMA,
 };
-use promptsign_core::util::iso8601_now;
+use promptsign_core::util::{hex, iso8601_now};
 use promptsign_core::Result;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 pub const DEFAULT_FULCIO: &str = "https://fulcio.sigstore.dev";
 pub const DEFAULT_REKOR: &str = "https://rekor.sigstore.dev";
 
-fn env_url(var: &str, default: &str) -> String {
+pub(crate) fn env_url(var: &str, default: &str) -> String {
     match std::env::var(var) {
         Ok(v) if !v.is_empty() => v.trim_end_matches('/').to_string(),
         _ => default.to_string(),
     }
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
         .user_agent(concat!("promptsign/", env!("CARGO_PKG_VERSION")))
@@ -49,7 +50,7 @@ pub(crate) fn http_get(url: &str) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-fn http_err(context: &str, e: ureq::Error) -> String {
+pub(crate) fn http_err(context: &str, e: ureq::Error) -> String {
     match e {
         ureq::Error::Status(code, resp) => {
             let body = resp.into_string().unwrap_or_default();
@@ -122,41 +123,85 @@ pub struct KeylessOutcome {
     pub log_index: i64,
 }
 
-/// Ephemeral key → Fulcio cert → sign → Rekor entry → self-contained bundle.
-/// The key never leaves this function and is dropped on return. `payload_type`
-/// is the DSSE payloadType (manifest for `sign`, revocation for a feed).
+/// The per-signature key. Rekor v2 accepts only signatures over a prehash, so
+/// a signature bound for a v2 log uses ECDSA P-256; otherwise Ed25519.
+enum EphemeralKey {
+    Ed25519(SigningKey),
+    P256(p256::ecdsa::SigningKey),
+}
+
+impl EphemeralKey {
+    fn generate(p256: bool) -> Result<EphemeralKey> {
+        let mut secret = [0u8; 32];
+
+        loop {
+            getrandom::getrandom(&mut secret).map_err(|e| format!("rng failure: {e}"))?;
+            if !p256 {
+                return Ok(EphemeralKey::Ed25519(SigningKey::from_bytes(&secret)));
+            }
+            // Fails only for zero or a value past the group order, which 32
+            // random bytes hit with negligible probability.
+            if let Ok(k) = p256::ecdsa::SigningKey::from_slice(&secret) {
+                return Ok(EphemeralKey::P256(k));
+            }
+        }
+    }
+
+    /// Fulcio's name for the key algorithm.
+    fn algorithm(&self) -> &'static str {
+        match self {
+            EphemeralKey::Ed25519(_) => "ED25519",
+            EphemeralKey::P256(_) => "ECDSA",
+        }
+    }
+
+    fn public_pem(&self) -> Result<String> {
+        match self {
+            EphemeralKey::Ed25519(k) => k.verifying_key().to_public_key_pem(LineEnding::LF),
+            EphemeralKey::P256(k) => k.verifying_key().to_public_key_pem(LineEnding::LF),
+        }
+        .map_err(|e| format!("public key encoding failed: {e}"))
+    }
+
+    /// Ed25519 raw, or ECDSA over SHA-256 of `message`, DER-encoded.
+    fn sign(&self, message: &[u8]) -> Vec<u8> {
+        match self {
+            EphemeralKey::Ed25519(k) => k.sign(message).to_bytes().to_vec(),
+            EphemeralKey::P256(k) => {
+                let sig: p256::ecdsa::DerSignature = k.sign(message);
+
+                sig.as_bytes().to_vec()
+            }
+        }
+    }
+}
+
+/// Ephemeral key → Fulcio cert → sign → timestamps → log entry →
+/// self-contained bundle. The key never leaves this function and is dropped
+/// on return. `payload_type` is the DSSE payloadType (manifest for `sign`,
+/// revocation for a feed). Endpoints come from the signing config.
 pub fn keyless_sign(
     payload: &[u8],
     payload_type: &str,
     token_flag: Option<&str>,
 ) -> Result<KeylessOutcome> {
+    let endpoints = crate::signing_config::resolve()?;
     let token = resolve_token(token_flag)?;
     // Fulcio checks the proof-of-possession against the identity it will
     // certify: the `email` claim for email-based tokens (Dex / Google logins),
     // the `sub` claim otherwise (e.g. CI workflow tokens). Mirrors sigstore's
     // SubjectFromToken.
     let subject = jwt_claim(&token, "email").or_else(|_| jwt_claim(&token, "sub"))?;
-
-    let mut secret = [0u8; 32];
-
-    getrandom::getrandom(&mut secret).map_err(|e| format!("rng failure: {e}"))?;
-
-    let key = SigningKey::from_bytes(&secret);
-    let pub_pem = key
-        .verifying_key()
-        .to_public_key_pem(LineEnding::LF)
-        .map_err(|e| format!("public key encoding failed: {e}"))?;
+    let key = EphemeralKey::generate(endpoints.rekor_version == 2)?;
     // Proof of possession: Fulcio requires a signature over the token's
     // subject so a stolen bare token cannot be bound to an attacker's key.
-    let pop = BASE64_STANDARD.encode(key.sign(subject.as_bytes()).to_bytes());
-
-    let fulcio = env_url("PROMPTSIGN_FULCIO_URL", DEFAULT_FULCIO);
+    let pop = BASE64_STANDARD.encode(key.sign(subject.as_bytes()));
     let resp: Value = agent()
-        .post(&format!("{fulcio}/api/v2/signingCert"))
+        .post(&format!("{}/api/v2/signingCert", endpoints.fulcio))
         .send_json(json!({
             "credentials": { "oidcIdentityToken": token },
             "publicKeyRequest": {
-                "publicKey": { "algorithm": "ED25519", "content": pub_pem },
+                "publicKey": { "algorithm": key.algorithm(), "content": key.public_pem()? },
                 "proofOfPossession": pop
             }
         }))
@@ -179,10 +224,71 @@ pub fn keyless_sign(
     let (identity, issuer, leaf_keyid) = chain_leaf_info(&chain_b64)?;
     let leaf_pem = certs[0].as_str().unwrap_or_default().trim().to_string();
 
-    let sig = key.sign(&pae(payload_type, payload));
-    let sig_b64 = BASE64_STANDARD.encode(sig.to_bytes());
+    let artifact = pae(payload_type, payload);
+    let sig = key.sign(&artifact);
+    let sig_b64 = BASE64_STANDARD.encode(&sig);
     let payload_b64 = BASE64_STANDARD.encode(payload);
 
+    // Timestamps first: a timestamp authority that fails leaves nothing in
+    // the log.
+    let timestamps = endpoints
+        .tsas
+        .iter()
+        .map(|url| request_timestamp(url, &sig).map(|t| BASE64_STANDARD.encode(t)))
+        .collect::<Result<Vec<_>>>()?;
+    let (transparency, log_index) = if endpoints.rekor_version == 2 {
+        let leaf_der = BASE64_STANDARD
+            .decode(&chain_b64[0])
+            .map_err(|_| "invalid base64 in certChain")?;
+
+        log_v2(&endpoints.rekor, &artifact, &sig, &leaf_der)?
+    } else {
+        log_v1(
+            &endpoints.rekor,
+            payload_type,
+            &payload_b64,
+            &sig_b64,
+            &leaf_pem,
+        )?
+    };
+
+    let mut bundle = json!({
+        "schema": BUNDLE_SCHEMA,
+        "envelope": {
+            "payloadType": payload_type,
+            "payload": payload_b64,
+            "signatures": [ { "keyid": leaf_keyid, "sig": sig_b64 } ]
+        },
+        "signer": {
+            "scheme": "keyless",
+            "identity": identity,
+            "issuer": issuer,
+            "certChain": chain_b64
+        },
+        "transparency": transparency
+    });
+
+    if !timestamps.is_empty() {
+        bundle["timestamps"] = json!(timestamps);
+    }
+
+    Ok(KeylessOutcome {
+        bundle,
+        identity,
+        issuer,
+        log_index,
+    })
+}
+
+/// A Rekor v1 `dsse` entry, and the transparency block with its signed entry
+/// timestamp (spec/05 §3.1).
+fn log_v1(
+    rekor: &str,
+    payload_type: &str,
+    payload_b64: &str,
+    sig_b64: &str,
+    leaf_pem: &str,
+) -> Result<(Value, i64)> {
     // Rekor wants the standard DSSE JSON as a string, verifier = leaf cert.
     let dsse_envelope = serde_json::to_string(&json!({
         "payloadType": payload_type,
@@ -190,7 +296,6 @@ pub fn keyless_sign(
         "signatures": [ { "sig": sig_b64 } ]
     }))
     .unwrap();
-    let rekor = env_url("PROMPTSIGN_REKOR_URL", DEFAULT_REKOR);
     let resp: Value = agent()
         .post(&format!("{rekor}/api/v1/log/entries"))
         .send_json(json!({
@@ -198,7 +303,7 @@ pub fn keyless_sign(
             "kind": "dsse",
             // verifiers entries are strfmt.Base64 in Rekor's dsse schema: the
             // PEM itself goes in base64-encoded, not raw.
-            "spec": { "proposedContent": { "envelope": dsse_envelope, "verifiers": [BASE64_STANDARD.encode(&leaf_pem)] } }
+            "spec": { "proposedContent": { "envelope": dsse_envelope, "verifiers": [BASE64_STANDARD.encode(leaf_pem)] } }
         }))
         .map_err(|e| http_err("Rekor", e))?
         .into_json()
@@ -224,28 +329,136 @@ pub fn keyless_sign(
         "body": entry.get("body").cloned().unwrap_or(Value::Null)
     });
 
-    let bundle = json!({
-        "schema": BUNDLE_SCHEMA,
-        "envelope": {
-            "payloadType": payload_type,
-            "payload": payload_b64,
-            "signatures": [ { "keyid": leaf_keyid, "sig": sig_b64 } ]
-        },
-        "signer": {
-            "scheme": "keyless",
-            "identity": identity,
-            "issuer": issuer,
-            "certChain": chain_b64
-        },
-        "transparency": transparency
+    Ok((transparency, log_index))
+}
+
+/// A Rekor v2 `hashedrekord` 0.0.2 entry, and the transparency block with
+/// its inclusion proof and checkpoint (spec/05 §3.2).
+fn log_v2(rekor: &str, artifact: &[u8], sig: &[u8], leaf_der: &[u8]) -> Result<(Value, i64)> {
+    let resp: Value = agent()
+        .post(&format!("{rekor}/api/v2/log/entries"))
+        .send_json(json!({
+            "hashedRekordRequestV002": {
+                "digest": BASE64_STANDARD.encode(Sha256::digest(artifact)),
+                "signature": {
+                    "content": BASE64_STANDARD.encode(sig),
+                    "verifier": {
+                        "x509Certificate": { "rawBytes": BASE64_STANDARD.encode(leaf_der) },
+                        "keyDetails": "PKIX_ECDSA_P256_SHA_256"
+                    }
+                }
+            }
+        }))
+        .map_err(|e| http_err("Rekor", e))?
+        .into_json()
+        .map_err(|e| format!("Rekor: {e}"))?;
+    // A TransparencyLogEntry in protobuf JSON, where int64 fields are strings.
+    let int = |v: &Value, what: &str| -> Result<i64> {
+        v.as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            .ok_or_else(|| format!("Rekor: no {what} in response"))
+    };
+    let log_index = int(&resp["logIndex"], "logIndex")?;
+    let key_id = BASE64_STANDARD
+        .decode(
+            resp["logId"]["keyId"]
+                .as_str()
+                .ok_or("Rekor: no logId in response")?,
+        )
+        .map_err(|_| "Rekor: invalid base64 in logId")?;
+    let proof = &resp["inclusionProof"];
+    let transparency = json!({
+        "logId": hex(&key_id),
+        "logIndex": log_index,
+        "body": resp["canonicalizedBody"]
+            .as_str()
+            .ok_or("Rekor: no canonicalizedBody in response")?,
+        "inclusionProof": {
+            "treeSize": int(&proof["treeSize"], "inclusion proof treeSize")?,
+            "rootHash": proof["rootHash"]
+                .as_str()
+                .ok_or("Rekor: no inclusion proof rootHash in response")?,
+            "hashes": proof["hashes"].as_array().cloned().unwrap_or_default(),
+            "checkpoint": proof["checkpoint"]["envelope"]
+                .as_str()
+                .ok_or("Rekor: no checkpoint in response")?
+        }
     });
 
-    Ok(KeylessOutcome {
-        bundle,
-        identity,
-        issuer,
-        log_index,
-    })
+    Ok((transparency, log_index))
+}
+
+/// A DER TimeStampReq (RFC 3161 §2.4.1) for SHA-256 of `signature`, asking
+/// for the authority's certificate in the token.
+fn timestamp_request(signature: &[u8]) -> Vec<u8> {
+    const SHA256_ALG: [u8; 15] = [
+        0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00,
+    ];
+    let mut req = vec![0x30, 0x39, 0x02, 0x01, 0x01, 0x30, 0x31];
+
+    req.extend(SHA256_ALG);
+    req.extend([0x04, 0x20]);
+    req.extend(Sha256::digest(signature));
+    req.extend([0x01, 0x01, 0xff]); // certReq TRUE
+    req
+}
+
+/// The tag and contents of the DER TLV at the start of `buf`.
+fn der_tlv(buf: &[u8]) -> Option<(u8, &[u8])> {
+    let (&tag, rest) = buf.split_first()?;
+    let (&first, rest) = rest.split_first()?;
+    let (len, rest) = if first < 0x80 {
+        (first as usize, rest)
+    } else {
+        let n = (first & 0x7f) as usize;
+
+        if n == 0 || n > 4 || rest.len() < n {
+            return None;
+        }
+        (
+            rest[..n]
+                .iter()
+                .fold(0usize, |acc, b| (acc << 8) | *b as usize),
+            &rest[n..],
+        )
+    };
+
+    Some((tag, rest.get(..len)?))
+}
+
+/// An RFC 3161 timestamp over `signature` from the authority at `url`, as the
+/// DER TimeStampResp the bundle stores (spec/05 §3.3).
+fn request_timestamp(url: &str, signature: &[u8]) -> Result<Vec<u8>> {
+    let context = format!("timestamp authority {url}");
+    let resp = agent()
+        .post(url)
+        .set("Content-Type", "application/timestamp-query")
+        .send_bytes(&timestamp_request(signature))
+        .map_err(|e| http_err(&context, e))?;
+    let mut body = Vec::new();
+
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(resp.into_reader(), 1 << 20),
+        &mut body,
+    )
+    .map_err(|e| format!("{context}: {e}"))?;
+
+    // TimeStampResp ::= SEQUENCE { status PKIStatusInfo, timeStampToken },
+    // and PKIStatusInfo opens with the status: 0 granted, 1 granted with
+    // modifications, anything else a refusal.
+    let status = der_tlv(&body)
+        .filter(|(tag, _)| *tag == 0x30)
+        .and_then(|(_, resp)| der_tlv(resp))
+        .filter(|(tag, _)| *tag == 0x30)
+        .and_then(|(_, info)| der_tlv(info))
+        .filter(|(tag, v)| *tag == 0x02 && v.len() == 1)
+        .map(|(_, v)| v[0])
+        .ok_or_else(|| format!("{context}: response is not a TimeStampResp"))?;
+
+    if status > 1 {
+        return Err(format!("{context}: request refused (status {status})"));
+    }
+    Ok(body)
 }
 
 /// A keyless root to verify against: the built-in one or one the user added,
@@ -336,8 +549,9 @@ fn ensure_no_loss(path: &std::path::Path, label: &str, fetched: &str) -> Result<
     .join("\n"))
 }
 
-/// One-time online step: cache the Fulcio CA chain and Rekor public key so
-/// every subsequent keyless verification is offline.
+/// One-time online step: cache the Fulcio CA chain and Rekor public key,
+/// and the public trusted_root.json and signing config, so every later
+/// keyless verification is offline.
 pub fn trust_fetch(force: bool) -> Result<()> {
     let dir = trust_dir();
 
@@ -369,6 +583,7 @@ pub fn trust_fetch(force: bool) -> Result<()> {
         return Err("Rekor: response is not a PEM public key".to_string());
     }
 
+    let documents = tuf_documents()?;
     let fulcio_path = dir.join("fulcio.pem");
     let rekor_path = dir.join("rekor.pub");
 
@@ -383,8 +598,65 @@ pub fn trust_fetch(force: bool) -> Result<()> {
 
     println!("wrote {}", fulcio_path.display());
     println!("wrote {}", rekor_path.display());
+
+    // The TUF documents replace what is there without the check above.
+    // Sigstore signs them with its root keys and keeps retired logs and CAs in
+    // them with closed windows, so an entry that disappears is one Sigstore
+    // removed on purpose, such as a revoked key.
+    for (name, bytes) in documents {
+        let path = dir.join(name);
+
+        std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        println!("wrote {}", path.display());
+    }
     println!("rekor log id: {}", trusted_log_id()?);
     Ok(())
+}
+
+/// The public trusted_root.json, which adds the Rekor v2 log and the
+/// timestamp authority to the pinned pair, and the public signing config,
+/// both from Sigstore's TUF repository. A private deployment named by
+/// PROMPTSIGN_FULCIO_URL or PROMPTSIGN_REKOR_URL skips them unless
+/// PROMPTSIGN_TUF_URL names its own repository.
+fn tuf_documents() -> Result<Vec<(&'static str, Vec<u8>)>> {
+    let set = |var: &str| std::env::var(var).is_ok_and(|v| !v.is_empty());
+
+    if (set("PROMPTSIGN_FULCIO_URL") || set("PROMPTSIGN_REKOR_URL")) && !set("PROMPTSIGN_TUF_URL") {
+        return Ok(Vec::new());
+    }
+
+    let mut targets = crate::tuf::Repo::from_env()?
+        .fetch_targets(&["trusted_root.json", "signing_config.v0.2.json"])?
+        .into_iter();
+    let (Some(trusted_root), Some(signing_config)) = (targets.next(), targets.next()) else {
+        return Err("TUF: missing target".into());
+    };
+    // Validated before anything is written, like the pair above.
+    let doc: Value =
+        serde_json::from_slice(&trusted_root).map_err(|e| format!("trusted_root.json: {e}"))?;
+
+    promptsign_core::trustroot::Root::from_trusted_root(
+        promptsign_core::trustroot::DEFAULT_ROOT,
+        &doc,
+    )
+    .map_err(|e| format!("trusted_root.json: {e}"))?;
+
+    let config: Value = serde_json::from_slice(&signing_config)
+        .map_err(|e| format!("signing_config.v0.2.json: {e}"))?;
+
+    crate::signing_config::select(&config, now())
+        .map_err(|e| format!("signing_config.v0.2.json: {e}"))?;
+    Ok(vec![
+        ("trusted_root.json", trusted_root),
+        (crate::signing_config::FILE, signing_config),
+    ])
+}
+
+pub(crate) fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 pub fn trust_show() -> Result<()> {
