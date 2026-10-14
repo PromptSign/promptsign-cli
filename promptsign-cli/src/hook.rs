@@ -6,7 +6,7 @@
 //
 //   SessionStart      — verify-tree over project + user instruction dirs;
 //                       failures are reported into session context (non-blocking
-//                       unless PROMPTSIGN_STRICT=1).
+//                       unless strict, see below).
 //   PreToolUse(Skill) — locate the invoked skill's directory and verify it,
 //                       through the nearest enclosing bundle (PromptSign or
 //                       OMS) when the skill was signed as part of a whole
@@ -19,7 +19,9 @@
 // Config via env:
 //   PROMPTSIGN_SKILL_ROOTS — extra skill roots, path-delimiter separated
 //   PROMPTSIGN_STRICT=1    — fail closed: unknown/unresolvable skills are
-//                            blocked, SessionStart failures exit 2
+//                            blocked, SessionStart failures exit 2. `strict:
+//                            true` in the managed or the user policy does the
+//                            same, and the environment cannot turn it off.
 
 use crate::{format_result, format_tree_report};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
@@ -41,7 +43,7 @@ mod codex;
 const PATH_DELIMITER: char = if cfg!(windows) { ';' } else { ':' };
 
 fn strict() -> bool {
-    std::env::var("PROMPTSIGN_STRICT").as_deref() == Ok("1")
+    promptsign_core::policy::strict_mode()
 }
 
 fn read_stdin_json() -> Value {

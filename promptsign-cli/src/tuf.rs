@@ -6,7 +6,6 @@
 // trust. It looks up top-level targets and does not follow delegations.
 
 use crate::keyless_client::agent;
-use promptsign_core::keyless::trust_dir;
 use promptsign_core::util::{format_iso8601, hex, parse_iso8601};
 use promptsign_core::Result;
 use serde_json::Value;
@@ -39,14 +38,15 @@ pub struct Repo {
 impl Repo {
     /// The repository `$PROMPTSIGN_TUF_URL` names (Sigstore's by default),
     /// trusting `$PROMPTSIGN_TUF_ROOT` as its initial root when set, else the
-    /// embedded Sigstore root.
-    pub fn from_env() -> Result<Repo> {
+    /// embedded Sigstore root. It keeps verified metadata under
+    /// `<trust_dir>/tuf/`.
+    pub fn from_env(trust_dir: &std::path::Path) -> Result<Repo> {
         let url = crate::keyless_client::env_url("PROMPTSIGN_TUF_URL", DEFAULT_TUF_URL);
         let initial_root = match std::env::var("PROMPTSIGN_TUF_ROOT") {
             Ok(p) if !p.is_empty() => std::fs::read(&p).map_err(|e| format!("{p}: {e}"))?,
             _ => EMBEDDED_ROOT.as_bytes().to_vec(),
         };
-        let cache = trust_dir().join("tuf").join(cache_name(&url));
+        let cache = trust_dir.join("tuf").join(cache_name(&url));
 
         Ok(Repo {
             url,

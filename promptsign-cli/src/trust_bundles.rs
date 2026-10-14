@@ -5,9 +5,8 @@
 
 use crate::keyless_client::http_get;
 use promptsign_core::trustbundle::{
-    check_user_trust_bundle, installed_user_bundles, store_trust_bundle, Check,
+    check_layer_trust_bundle, installed_layer_bundles, layer_trust_dir, store_trust_bundle, Check,
 };
-use promptsign_core::trustroot::user_trust_dir;
 use promptsign_core::util::{format_iso8601, glob_match};
 use promptsign_core::Result;
 use serde_json::Value;
@@ -52,11 +51,11 @@ fn read_source(src: &str) -> Result<(Vec<u8>, Vec<u8>, Option<String>)> {
     Ok((read(src)?, read(&format!("{src}.psig.json"))?, None))
 }
 
-fn check(name: &str, bytes: &[u8], sidecar: &[u8]) -> Result<Check> {
+fn check(managed: bool, name: &str, bytes: &[u8], sidecar: &[u8]) -> Result<Check> {
     let sidecar: Value =
         serde_json::from_slice(sidecar).map_err(|e| format!("trust bundle signature: {e}"))?;
 
-    check_user_trust_bundle(name, bytes, &sidecar, now())
+    check_layer_trust_bundle(managed, name, bytes, &sidecar, now())
 }
 
 fn describe(c: &Check) {
@@ -112,12 +111,14 @@ pub fn confirm(question: &str, yes: bool, command: &str) -> Result<()> {
     }
 }
 
-/// `trust add <name> <url|file> [--signer <glob>] [--yes]`. A first install
-/// trusts the bundle's own signers, so it needs the user's consent. An update
-/// signed by a signer the installed version names does not.
-pub fn add(name: &str, src: &str, signer: Option<&str>, yes: bool) -> Result<()> {
+/// `trust add <name> <url|file> [--signer <glob>] [--yes] [--managed]`. A
+/// first install trusts the bundle's own signers, so it needs the user's
+/// consent. An update signed by a signer the installed version names does
+/// not. `managed` installs into the machine's managed trust directory.
+pub fn add(name: &str, src: &str, signer: Option<&str>, yes: bool, managed: bool) -> Result<()> {
     let (bytes, sidecar, url) = read_source(src)?;
-    let c = check(name, &bytes, &sidecar)?;
+    let c = check(managed, name, &bytes, &sidecar)?;
+    let dir = layer_trust_dir(managed);
 
     describe(&c);
     if c.unchanged {
@@ -144,21 +145,22 @@ pub fn add(name: &str, src: &str, signer: Option<&str>, yes: bool) -> Result<()>
             "trust add",
         )?;
     }
-    store_trust_bundle(&user_trust_dir(), name, &bytes, &sidecar, url.as_deref())?;
+    store_trust_bundle(&dir, name, &bytes, &sidecar, url.as_deref())?;
     println!(
         "{} trust bundle \"{name}\" version {} in {}",
         if c.update { "updated" } else { "installed" },
         c.bundle.version,
-        user_trust_dir().join("bundles").join(name).display()
+        dir.join("bundles").join(name).display()
     );
     Ok(())
 }
 
-/// `trust fetch <name>`, or every installed bundle when `only` is None.
-/// Reports each bundle and errors if any could not be refreshed, leaving that
-/// one at its installed version.
-pub fn fetch(only: Option<&str>) -> Result<()> {
-    let installed = installed_user_bundles(now())?;
+/// `trust fetch <name>`, or every installed bundle when `only` is None, in
+/// the user's trust directory or the managed one. Reports each bundle and
+/// errors if any could not be refreshed, leaving that one at its installed
+/// version.
+pub fn fetch(only: Option<&str>, managed: bool) -> Result<()> {
+    let installed = installed_layer_bundles(managed, now())?;
     let mut failed = Vec::new();
     let mut seen = false;
 
@@ -175,10 +177,16 @@ pub fn fetch(only: Option<&str>) -> Result<()> {
             continue;
         };
         let outcome = read_source(url).and_then(|(bytes, sidecar, _)| {
-            let c = check(&name, &bytes, &sidecar)?;
+            let c = check(managed, &name, &bytes, &sidecar)?;
 
             if !c.unchanged {
-                store_trust_bundle(&user_trust_dir(), &name, &bytes, &sidecar, Some(url))?;
+                store_trust_bundle(
+                    &layer_trust_dir(managed),
+                    &name,
+                    &bytes,
+                    &sidecar,
+                    Some(url),
+                )?;
             }
             Ok(c)
         });

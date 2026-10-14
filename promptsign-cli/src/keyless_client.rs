@@ -7,9 +7,7 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::{Signer, SigningKey};
 use promptsign_core::bundle::{pae, BUNDLE_SCHEMA};
-use promptsign_core::keyless::{
-    chain_leaf_info, pem_chain_to_b64_der, trust_dir, trusted_log_id, trusted_log_ids,
-};
+use promptsign_core::keyless::{chain_leaf_info, pem_chain_to_b64_der, trust_dir, trusted_log_ids};
 use promptsign_core::revocation::{
     feed_path, load_cached_feed, verify_feed, RevocationEntry, RevocationFeed,
     REVOCATION_PAYLOAD_TYPE, REVOCATION_SCHEMA,
@@ -551,11 +549,10 @@ fn ensure_no_loss(path: &std::path::Path, label: &str, fetched: &str) -> Result<
 
 /// One-time online step: cache the Fulcio CA chain and Rekor public key,
 /// and the public trusted_root.json and signing config, so every later
-/// keyless verification is offline.
-pub fn trust_fetch(force: bool) -> Result<()> {
-    let dir = trust_dir();
-
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+/// keyless verification is offline. `dir` is the trust directory, or the
+/// managed one for `trust fetch --managed`.
+pub fn trust_fetch(force: bool, dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
 
     let fulcio = env_url("PROMPTSIGN_FULCIO_URL", DEFAULT_FULCIO);
     let rekor = env_url("PROMPTSIGN_REKOR_URL", DEFAULT_REKOR);
@@ -583,7 +580,7 @@ pub fn trust_fetch(force: bool) -> Result<()> {
         return Err("Rekor: response is not a PEM public key".to_string());
     }
 
-    let documents = tuf_documents()?;
+    let documents = tuf_documents(dir)?;
     let fulcio_path = dir.join("fulcio.pem");
     let rekor_path = dir.join("rekor.pub");
 
@@ -609,7 +606,16 @@ pub fn trust_fetch(force: bool) -> Result<()> {
         std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
         println!("wrote {}", path.display());
     }
-    println!("rekor log id: {}", trusted_log_id()?);
+    let pinned = promptsign_core::trustroot::Root::from_pem(
+        promptsign_core::trustroot::DEFAULT_ROOT,
+        ca_pem.as_bytes(),
+        &rekor_pem,
+    )
+    .map_err(|e| format!("{}: {e}", dir.display()))?;
+
+    if let Some(log) = pinned.rekor_logs.first() {
+        println!("rekor log id: {}", log.log_id);
+    }
     Ok(())
 }
 
@@ -618,14 +624,14 @@ pub fn trust_fetch(force: bool) -> Result<()> {
 /// both from Sigstore's TUF repository. A private deployment named by
 /// PROMPTSIGN_FULCIO_URL or PROMPTSIGN_REKOR_URL skips them unless
 /// PROMPTSIGN_TUF_URL names its own repository.
-fn tuf_documents() -> Result<Vec<(&'static str, Vec<u8>)>> {
+fn tuf_documents(dir: &std::path::Path) -> Result<Vec<(&'static str, Vec<u8>)>> {
     let set = |var: &str| std::env::var(var).is_ok_and(|v| !v.is_empty());
 
     if (set("PROMPTSIGN_FULCIO_URL") || set("PROMPTSIGN_REKOR_URL")) && !set("PROMPTSIGN_TUF_URL") {
         return Ok(Vec::new());
     }
 
-    let mut targets = crate::tuf::Repo::from_env()?
+    let mut targets = crate::tuf::Repo::from_env(dir)?
         .fetch_targets(&["trusted_root.json", "signing_config.v0.2.json"])?
         .into_iter();
     let (Some(trusted_root), Some(signing_config)) = (targets.next(), targets.next()) else {
@@ -678,17 +684,20 @@ pub fn trust_show() -> Result<()> {
 
 // ---- Revocation feed (spec/06) ----
 
+/// The policy whose revocation settings apply (spec/04): the managed policy
+/// when it names a feed, else the user's. A project's never do.
 fn load_active_policy() -> Result<promptsign_core::policy::Policy> {
-    // Revocation settings come from the user's policy only (spec/04).
-    let (policy, _raw, _src) = promptsign_core::policy::load_policy(None)?;
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let eff = promptsign_core::policy::load_effective_policy(None, &cwd)?;
 
-    Ok(policy)
+    Ok(eff.revocation().unwrap_or(eff.base()).clone())
 }
 
 /// Opportunistic online refresh: fetch the policy's `revocation_feed`, verify it
 /// against the pinned feed identity, and cache it for offline verification. This
-/// is the only online step in the revocation path.
-pub fn revoke_fetch() -> Result<()> {
+/// is the only online step in the revocation path. `managed` writes the
+/// managed copy, which every user on the machine reads.
+pub fn revoke_fetch(managed: bool) -> Result<()> {
     let policy = load_active_policy()?;
     let url = policy
         .revocation_feed
@@ -702,7 +711,11 @@ pub fn revoke_fetch() -> Result<()> {
         .map_err(|e| format!("revocation feed: {e}"))?;
     // Validate before persisting: never cache a feed we would not trust.
     let feed = verify_feed(&bundle, &policy)?;
-    let path = feed_path();
+    let path = if managed {
+        promptsign_core::managed::managed_revocation_path()
+    } else {
+        feed_path()
+    };
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
@@ -721,34 +734,44 @@ pub fn revoke_fetch() -> Result<()> {
     Ok(())
 }
 
-/// Show the cached feed's status (offline).
+/// Show the cached feed's status (offline), and the managed copy's when
+/// the machine has one. The verifier uses whichever copy is newer.
 pub fn revoke_show() -> Result<()> {
     let path = feed_path();
-    let bundle = match load_cached_feed()? {
-        Some(b) => b,
-        None => {
-            println!(
-                "no revocation feed cached ({}) — run `promptsign revoke fetch`",
-                path.display()
-            );
-            return Ok(());
+    let managed = promptsign_core::managed::managed_revocation_path();
+    let policy = load_active_policy()?;
+    let show = |label: &str, path: &std::path::Path, bundle: Value| {
+        println!("{label}: {}", path.display());
+        match verify_feed(&bundle, &policy) {
+            Ok(feed) => {
+                let stale = promptsign_core::revocation::is_stale(&feed, &policy);
+
+                println!(
+                    "generated: {}{}",
+                    feed.generated_at,
+                    if stale { " (STALE)" } else { "" }
+                );
+                println!("entries: {}", feed.entries.len());
+            }
+            Err(e) => println!("NOT TRUSTED: {e}"),
         }
     };
-    let policy = load_active_policy()?;
 
-    println!("feed cache: {}", path.display());
-    match verify_feed(&bundle, &policy) {
-        Ok(feed) => {
-            let stale = promptsign_core::revocation::is_stale(&feed, &policy);
+    if managed.exists() {
+        let bundle: Value = std::fs::read(&managed)
+            .map_err(|e| e.to_string())
+            .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
+            .map_err(|e| format!("{}: {e}", managed.display()))?;
 
-            println!(
-                "generated: {}{}",
-                feed.generated_at,
-                if stale { " (STALE)" } else { "" }
-            );
-            println!("entries: {}", feed.entries.len());
-        }
-        Err(e) => println!("NOT TRUSTED: {e}"),
+        show("managed feed", &managed, bundle);
+    }
+    match load_cached_feed()? {
+        Some(bundle) => show("feed cache", &path, bundle),
+        None if managed.exists() => {}
+        None => println!(
+            "no revocation feed cached ({}) — run `promptsign revoke fetch`",
+            path.display()
+        ),
     }
     Ok(())
 }

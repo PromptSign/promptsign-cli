@@ -257,7 +257,8 @@ its roots as a trust bundle (spec/07): a `trust-bundle.json` signed with plain
 `promptsign sign`, served with its `.psig.json` beside it.
 
 ```bash
-promptsign trust add acme https://trust.acme.example/trust-bundle.json \n  --signer 'https://github.com/acme/trust/*'   # shows signer and roots, asks first
+promptsign trust add acme https://trust.acme.example/trust-bundle.json \
+  --signer 'https://github.com/acme/trust/*'   # shows signer and roots, asks first
 promptsign trust list                          # acme/<root> entries, version, expiry
 promptsign trust fetch                         # refreshes the Sigstore roots and every bundle
 promptsign trust rm acme
@@ -267,6 +268,24 @@ After the first install, `trust fetch` accepts a new version only when a signer
 the installed version lists signed it and its version number is higher, so a
 replayed old bundle is refused. A bundle past its expiry still verifies, with a
 warning, or a failure under `"on_trust_bundle_stale": "fail"` in your policy.
+
+On a fleet, an administrator installs the bundle once for every user, in the
+managed directory (`C:\ProgramData\PromptSign`,
+`/Library/Application Support/PromptSign` or `/etc/promptsign`, spec/04):
+
+```bash
+promptsign trust add acme https://trust.acme.example/trust-bundle.json \
+  --signer 'https://github.com/acme/trust/*' --yes --managed
+promptsign trust fetch --managed               # run on a schedule, as an administrator
+```
+
+A `managed-policy.json` in the same directory is the policy every user starts
+from. A user's own policy and a project's can only tighten it. It also takes
+`"strict": true` (hooks fail closed), `"lock_env": true` (ignore
+`PROMPTSIGN_HOME`, `PROMPTSIGN_POLICY`, `PROMPTSIGN_TRUST_DIR` and
+`PROMPTSIGN_REVOCATION_FILE`) and `"user_roots": false` (trust only the managed
+roots and the built-in one). `promptsign policy show` prints every layer and
+where it came from.
 
 Keep the `.psig.json` sidecar next to the archive under its original name; that
 pairing is how `verify` finds it. Bare `promptsign verify` pins the signer on

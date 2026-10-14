@@ -18,9 +18,7 @@ use promptsign_core::bundle::{sign_manifest, write_bundle};
 #[cfg(feature = "local-key")]
 use promptsign_core::keys::{default_identity, default_key_path, keygen, load_private_key};
 use promptsign_core::manifest::{build_manifest, BuildOptions};
-use promptsign_core::policy::{
-    default_policy, load_pins, load_policy, load_project_policy, save_pins, Action,
-};
+use promptsign_core::policy::{default_policy, load_pins, policy_layers, save_pins, Action};
 use promptsign_core::util::{promptsign_home, short16, write_private};
 use promptsign_core::verify::{verify_target, VerifyOptions, VerifyResult};
 use promptsign_core::verifytree::verify_tree;
@@ -43,13 +41,13 @@ Usage:
   promptsign sign <dir|file> [--identity-token <jwt>] [--embed] [--name n] [--version v] [--kind k]
   promptsign verify <dir|file> [--policy path] [--json] [--no-pin-updates]
   promptsign verify-tree <root>... [--policy path] [--json] [--quiet] [--no-pin-updates]
-  promptsign policy init [--global] | policy show  (yours, plus any project policy, which only tightens it)
+  promptsign policy init [--global] | policy show  (the machine's managed policy, yours, and the project's)
   promptsign pin list | pin rm <name>
-  promptsign trust fetch [--force] [<bundle>] | trust show   (refresh Sigstore roots and trust bundles)
-  promptsign trust add <name> --ca <pem> | trust add <name> --trusted-root <json> [--yes]
-  promptsign trust add <name> <url|file> [--signer <glob>] [--yes]   (an organization's trust bundle)
-  promptsign trust list | trust rm <name>          (roots a signature may chain to)
-  promptsign revoke fetch | revoke show  (refresh/inspect the cached revocation feed)
+  promptsign trust fetch [--force] [--managed] [<bundle>] | trust show   (refresh Sigstore roots and trust bundles)
+  promptsign trust add <name> --ca <pem> | trust add <name> --trusted-root <json> [--yes] [--managed]
+  promptsign trust add <name> <url|file> [--signer <glob>] [--yes] [--managed]   (an organization's trust bundle)
+  promptsign trust list | trust rm <name> [--managed]   (roots a signature may chain to)
+  promptsign revoke fetch [--managed] | revoke show  (refresh/inspect the cached revocation feed)
   promptsign revoke sign <entries.json> [--out path]   (publish a signed revocation feed)
   promptsign hook [event] [--codex]   (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
   promptsign proxy [--host h] [--port p] [--allow-origin o] [--allow-host h]
@@ -64,7 +62,11 @@ include the scripts they run); for a single file, a sidecar <file>.psig.json.
 With --embed, a single Markdown file's signature is written into its own YAML
 frontmatter (x-promptsign:) instead of a sidecar, so it travels with the file
 (not allowed for CLAUDE.md/AGENTS.md — those keep the sidecar).
-Verification = signature + integrity against disk + trust policy + TOFU pins.";
+Verification = signature + integrity against disk + trust policy + TOFU pins.
+
+An administrator's managed-policy.json and trust/ in MANAGED_DIR apply to every
+user on the machine; your policy and a project's can only add to them.
+--managed writes there (run it as an administrator).";
 
 #[cfg(feature = "local-key")]
 const USAGE: &str = "promptsign VERSION — identity-verified signing for AI instruction files
@@ -76,12 +78,13 @@ Usage:
   promptsign keygen [--identity <id>] [--force]
   promptsign verify <dir|file> [--policy path] [--json] [--no-pin-updates]
   promptsign verify-tree <root>... [--policy path] [--json] [--quiet] [--no-pin-updates]
-  promptsign policy init [--global] | policy show  (yours, plus any project policy, which only tightens it)
+  promptsign policy init [--global] | policy show  (the machine's managed policy, yours, and the project's)
   promptsign pin list | pin rm <name>
-  promptsign trust fetch [--force] | trust show   (cache Sigstore roots for offline verify)
-  promptsign trust add <name> --ca <pem> | trust add <name> --trusted-root <json> [--yes]
-  promptsign trust list | trust rm <name>          (roots a signature may chain to)
-  promptsign revoke fetch | revoke show  (refresh/inspect the cached revocation feed)
+  promptsign trust fetch [--force] [--managed] [<bundle>] | trust show   (cache Sigstore roots for offline verify)
+  promptsign trust add <name> --ca <pem> | trust add <name> --trusted-root <json> [--yes] [--managed]
+  promptsign trust add <name> <url|file> [--signer <glob>] [--yes] [--managed]   (an organization's trust bundle)
+  promptsign trust list | trust rm <name> [--managed]   (roots a signature may chain to)
+  promptsign revoke fetch [--managed] | revoke show  (refresh/inspect the cached revocation feed)
   promptsign revoke sign <entries.json> [--out path]   (publish a signed revocation feed)
   promptsign hook [event] [--codex]   (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
   promptsign proxy [--host h] [--port p] [--allow-origin o] [--allow-host h]
@@ -96,7 +99,21 @@ include the scripts they run); for a single file, a sidecar <file>.psig.json.
 With --embed, a single Markdown file's signature is written into its own YAML
 frontmatter (x-promptsign:) instead of a sidecar, so it travels with the file
 (not allowed for CLAUDE.md/AGENTS.md — those keep the sidecar).
-Verification = signature + integrity against disk + trust policy + TOFU pins.";
+Verification = signature + integrity against disk + trust policy + TOFU pins.
+
+An administrator's managed-policy.json and trust/ in MANAGED_DIR apply to every
+user on the machine; your policy and a project's can only add to them.
+--managed writes there (run it as an administrator).";
+
+fn usage() -> String {
+    USAGE.replacen("VERSION", VERSION, 1).replacen(
+        "MANAGED_DIR",
+        &promptsign_core::managed::platform_dir()
+            .display()
+            .to_string(),
+        1,
+    )
+}
 
 fn fail(msg: &str) -> ! {
     eprintln!("promptsign: {msg}");
@@ -556,17 +573,27 @@ fn cmd_sign(rest: &[String]) -> ExitCode {
 fn cmd_trust(rest: &[String]) -> ExitCode {
     match rest.first().map(String::as_str) {
         Some("fetch") => {
-            let p = args::parse(&rest[1..], &[], &["force"]).unwrap_or_else(|e| fail(&e));
+            let p =
+                args::parse(&rest[1..], &[], &["force", "managed"]).unwrap_or_else(|e| fail(&e));
+            let managed = p.flags.contains("managed");
 
             // A name refreshes that bundle alone. No name refreshes the built-in
             // root, then every installed bundle (spec/07 §2.2).
             if let Some(name) = p.positionals.first() {
-                return trust_bundles::fetch(Some(name))
+                return trust_bundles::fetch(Some(name), managed)
                     .map(|_| ExitCode::SUCCESS)
                     .unwrap_or_else(|e| fail(&e));
             }
-            keyless_client::trust_fetch(p.flags.contains("force")).unwrap_or_else(|e| fail(&e));
-            trust_bundles::fetch(None)
+
+            let dir = if managed {
+                promptsign_core::managed::managed_trust_dir()
+            } else {
+                promptsign_core::keyless::trust_dir()
+            };
+
+            keyless_client::trust_fetch(p.flags.contains("force"), &dir)
+                .unwrap_or_else(|e| fail(&e));
+            trust_bundles::fetch(None, managed)
                 .map(|_| ExitCode::SUCCESS)
                 .unwrap_or_else(|e| fail(&e))
         }
@@ -576,21 +603,19 @@ fn cmd_trust(rest: &[String]) -> ExitCode {
         Some("add") => cmd_trust_add(&rest[1..]),
         Some("list") => cmd_trust_list(),
         Some("rm") => {
-            let name = rest
-                .get(1)
+            let p = args::parse(&rest[1..], &[], &["managed"]).unwrap_or_else(|e| fail(&e));
+            let name = p
+                .positionals
+                .first()
                 .unwrap_or_else(|| fail("trust rm: missing <name>"));
+            let dir = trustbundle::layer_trust_dir(p.flags.contains("managed"));
 
-            if trustroot::user_trust_dir()
-                .join("bundles")
-                .join(name)
-                .is_dir()
-            {
-                trustbundle::remove_trust_bundle(&trustroot::user_trust_dir(), name)
-                    .unwrap_or_else(|e| fail(&e));
+            if dir.join("bundles").join(name).is_dir() {
+                trustbundle::remove_trust_bundle(&dir, name).unwrap_or_else(|e| fail(&e));
                 println!("removed trust bundle \"{name}\" and its roots");
                 return ExitCode::SUCCESS;
             }
-            trustroot::remove_user_root(name).unwrap_or_else(|e| fail(&e));
+            trustroot::remove_root(&dir, name).unwrap_or_else(|e| fail(&e));
             println!("removed trust root \"{name}\"");
             ExitCode::SUCCESS
         }
@@ -598,15 +623,17 @@ fn cmd_trust(rest: &[String]) -> ExitCode {
     }
 }
 
-/// Add a root to the user's registry. Trusting a root lets every certificate
-/// it issued sign for you, so show what it is and ask first.
+/// Add a root to the user's registry, or with --managed to the machine's.
+/// Trusting a root lets every certificate it issued sign for you, so show
+/// what it is and ask first.
 fn cmd_trust_add(rest: &[String]) -> ExitCode {
-    let p =
-        args::parse(rest, &["ca", "trusted-root", "signer"], &["yes"]).unwrap_or_else(|e| fail(&e));
+    let p = args::parse(rest, &["ca", "trusted-root", "signer"], &["yes", "managed"])
+        .unwrap_or_else(|e| fail(&e));
     let name = p
         .positionals
         .first()
         .unwrap_or_else(|| fail("trust add: missing <name>"));
+    let managed = p.flags.contains("managed");
 
     if let Some(src) = p.positionals.get(1) {
         if p.values.contains_key("ca") || p.values.contains_key("trusted-root") {
@@ -617,6 +644,7 @@ fn cmd_trust_add(rest: &[String]) -> ExitCode {
             src,
             p.values.get("signer").map(String::as_str),
             p.flags.contains("yes"),
+            managed,
         )
         .map(|_| ExitCode::SUCCESS)
         .unwrap_or_else(|e| fail(&e));
@@ -633,6 +661,17 @@ fn cmd_trust_add(rest: &[String]) -> ExitCode {
         ),
     }
     .unwrap_or_else(|e| fail(&e));
+    let taken = trustroot::load_registry()
+        .unwrap_or_else(|e| fail(&e))
+        .into_iter()
+        .any(|r| r.managed && r.name.split('/').next() == Some(name.as_str()));
+
+    if taken && !managed {
+        fail(&format!(
+            "trust add: \"{name}\" is the name of a managed trust root or bundle"
+        ));
+    }
+
     let kind = if candidate.is_ca_only() {
         "certificate (no transparency log; checked at the current time)"
     } else {
@@ -650,11 +689,12 @@ fn cmd_trust_add(rest: &[String]) -> ExitCode {
     )
     .unwrap_or_else(|e| fail(&e));
 
+    let dir = trustbundle::layer_trust_dir(managed);
     let added = match (p.values.get("ca"), p.values.get("trusted-root")) {
-        (Some(pem), _) => trustroot::add_user_ca_root(name, &read(pem)),
+        (Some(pem), _) => trustroot::add_ca_root(&dir, name, &read(pem)),
         (_, Some(doc)) => serde_json::from_slice(&read(doc))
             .map_err(|e| format!("{doc}: {e}"))
-            .and_then(|v| trustroot::add_user_trusted_root(name, &v)),
+            .and_then(|v| trustroot::add_trusted_root(&dir, name, &v)),
         _ => unreachable!(),
     }
     .unwrap_or_else(|e| fail(&e));
@@ -662,18 +702,21 @@ fn cmd_trust_add(rest: &[String]) -> ExitCode {
     println!(
         "added trust root \"{}\" to {}",
         added.name,
-        trustroot::user_trust_dir().join("roots").display()
+        dir.join("roots").display()
     );
     ExitCode::SUCCESS
 }
 
 fn cmd_trust_list() -> ExitCode {
-    let roots = trustroot::load_registry().unwrap_or_else(|e| fail(&e));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default();
-    let bundles = trustbundle::installed_user_bundles(now).unwrap_or_else(|e| fail(&e));
+    let trustroot::Registry {
+        roots,
+        bundles,
+        ignored,
+    } = trustroot::load_full_registry(now).unwrap_or_else(|e| fail(&e));
 
     if roots.is_empty() {
         println!("no trust roots: run \"promptsign trust fetch\"");
@@ -690,7 +733,8 @@ fn cmd_trust_list() -> ExitCode {
             .and_then(|(b, _)| bundles.iter().find(|i| i.bundle.name == b))
             .map(|i| {
                 format!(
-                    "  (bundle {} v{}, expires {}{})",
+                    "  ({}bundle {} v{}, expires {}{})",
+                    if i.managed { "managed " } else { "" },
                     i.bundle.name,
                     i.bundle.version,
                     promptsign_core::util::format_iso8601(i.bundle.expires),
@@ -701,21 +745,34 @@ fn cmd_trust_list() -> ExitCode {
                     }
                 )
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                if r.managed {
+                    "  (managed)".to_string()
+                } else {
+                    String::new()
+                }
+            });
 
         println!(
             "{:<20} {:<12} sha256:{}  {}{from}",
             r.name, kind, r.fingerprint, r.subject
         );
     }
+    for note in ignored {
+        println!("{note}");
+    }
     ExitCode::SUCCESS
 }
 
 fn cmd_revoke(rest: &[String]) -> ExitCode {
     match rest.first().map(String::as_str) {
-        Some("fetch") => keyless_client::revoke_fetch()
-            .map(|_| ExitCode::SUCCESS)
-            .unwrap_or_else(|e| fail(&e)),
+        Some("fetch") => {
+            let p = args::parse(&rest[1..], &[], &["managed"]).unwrap_or_else(|e| fail(&e));
+
+            keyless_client::revoke_fetch(p.flags.contains("managed"))
+                .map(|_| ExitCode::SUCCESS)
+                .unwrap_or_else(|e| fail(&e))
+        }
         Some("show") => keyless_client::revoke_show()
             .map(|_| ExitCode::SUCCESS)
             .unwrap_or_else(|e| fail(&e)),
@@ -842,19 +899,76 @@ fn cmd_policy(rest: &[String]) -> ExitCode {
         }
         Some("show") => {
             let cwd = std::env::current_dir().unwrap_or_else(|e| fail(&e.to_string()));
-            let (_policy, raw, source) = load_policy(None).unwrap_or_else(|e| fail(&e));
 
-            println!("# source: {source}");
-            println!("{}", serde_json::to_string_pretty(&raw).unwrap());
-            if let Some((_p, raw, source)) = load_project_policy(&cwd).unwrap_or_else(|e| fail(&e))
-            {
-                println!("# project policy (tighten only): {source}");
-                println!("{}", serde_json::to_string_pretty(&raw).unwrap());
-            }
+            print!("{}", policy_show(&cwd).unwrap_or_else(|e| fail(&e)));
             ExitCode::SUCCESS
         }
         _ => fail("policy: expected \"init\" or \"show\""),
     }
+}
+
+/// `policy show`: every layer with the file it came from (spec/04), then the
+/// settings in effect.
+fn policy_show(cwd: &Path) -> promptsign_core::Result<String> {
+    let layers = policy_layers(None, cwd)?;
+    let managed = layers.iter().find(|l| l.layer == "managed");
+    let mut out = String::new();
+
+    for l in &layers {
+        let header = match (l.layer, managed.is_some()) {
+            ("managed", _) => format!("# managed policy: {}", l.source),
+            ("user", true) => format!("# user policy (tighten only): {}", l.source),
+            ("user", false) => format!("# source: {}", l.source),
+            _ => format!("# project policy (tighten only): {}", l.source),
+        };
+
+        let _ = writeln!(out, "{header}");
+        let _ = writeln!(out, "{}", serde_json::to_string_pretty(&l.policy).unwrap());
+    }
+
+    let set = |layer: &str, key: &str| {
+        layers
+            .iter()
+            .any(|l| l.layer == layer && l.policy[key] == true)
+    };
+    let strict = if std::env::var("PROMPTSIGN_STRICT").as_deref() == Ok("1") {
+        "on (PROMPTSIGN_STRICT=1)"
+    } else if set("managed", "strict") {
+        "on (managed policy)"
+    } else if set("user", "strict") {
+        "on (user policy)"
+    } else {
+        "off"
+    };
+
+    if let Some(m) = managed {
+        if !layers.iter().any(|l| l.layer == "user") {
+            let _ = writeln!(
+                out,
+                "# user policy: none (the built-in default does not apply under a managed policy)"
+            );
+        }
+        let _ = writeln!(
+            out,
+            "# lock_env: {}",
+            if m.policy["lock_env"] == true {
+                "on (PROMPTSIGN_POLICY, PROMPTSIGN_HOME, PROMPTSIGN_TRUST_DIR and PROMPTSIGN_REVOCATION_FILE are ignored)"
+            } else {
+                "off"
+            }
+        );
+        let _ = writeln!(
+            out,
+            "# user_roots: {}",
+            if m.policy["user_roots"] == false {
+                "off (only managed roots and the built-in root are trusted)"
+            } else {
+                "on"
+            }
+        );
+    }
+    let _ = writeln!(out, "# strict: {strict}");
+    Ok(out)
 }
 
 fn cmd_pin(rest: &[String]) -> ExitCode {
@@ -916,7 +1030,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "help" | "--help" | "-h" => {
-            println!("{}", USAGE.replacen("VERSION", VERSION, 1));
+            println!("{}", usage());
             ExitCode::SUCCESS
         }
         other => fail(&format!(
