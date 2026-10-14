@@ -287,6 +287,20 @@ from. A user's own policy and a project's can only tighten it. It also takes
 roots and the built-in one). `promptsign policy show` prints every layer and
 where it came from.
 
+With `"decision_log": true` in the managed policy, each verification, in a
+hook or on the command line, appends a JSON line to
+`<managed>/log/decisions-<user>.jsonl` (spec/08). A line names the signer and
+the verdict, along with the policy rule that decided it, and a log shipper can
+tail the file. It rotates at 10 MiB (`decision_log_max_bytes`) and keeps four
+old copies. You can log your own verifications the same way from your policy,
+and `--decision-log <file>` on `verify`, `verify-tree` or `hook` writes one
+more file.
+
+A bundle can also name the organization's revocation feed (spec/06). With
+`"revocation_feed": "trust-bundle:acme"` in the policy, `promptsign revoke fetch`
+downloads the feed the bundle names. The feed may chain to any root you trust,
+including the organization's own Fulcio or a CA with no transparency log.
+
 Keep the `.psig.json` sidecar next to the archive under its original name; that
 pairing is how `verify` finds it. Bare `promptsign verify` pins the signer on
 first use (TOFU) and holds across releases, since archive names carry the

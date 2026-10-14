@@ -18,8 +18,12 @@
 // check those files get. Every refusal is a JSON decision on stdout, never exit
 // 2 (see `refuse`).
 
-use super::{extra_skill_roots, skill_failure, skill_name_candidates, strict, subdirs, SkillDir};
+use super::{
+    extra_skill_roots, log_session, skill_failure, skill_name_candidates, strict, subdirs, Log,
+    SkillDir,
+};
 use crate::format_tree_report;
+use promptsign_core::decision_log::Decision;
 use promptsign_core::policy::Action;
 use promptsign_core::util::home_dir;
 use promptsign_core::verify::VerifyOptions;
@@ -375,9 +379,13 @@ fn block_prompt(reason: &str) -> Value {
 }
 
 /// Verifies each skill in turn and refuses on the first that fails.
-fn check_skills(skills: Vec<(String, SkillDir)>, refusal: fn(&str) -> Value) -> ExitCode {
+fn check_skills(
+    skills: Vec<(String, SkillDir)>,
+    refusal: fn(&str) -> Value,
+    log: &mut Log,
+) -> ExitCode {
     for (name, skill) in skills {
-        if let Some(reason) = skill_failure(&name, &skill) {
+        if let Some(reason) = skill_failure(&name, &skill, log) {
             return refuse(refusal(&reason));
         }
     }
@@ -390,9 +398,9 @@ fn push_unique(skills: &mut Vec<(String, SkillDir)>, found: (String, SkillDir)) 
     }
 }
 
-pub(super) fn pre_tool_use(input: &Value, cwd: &Path) -> ExitCode {
+pub(super) fn pre_tool_use(input: &Value, cwd: &Path, log: &mut Log) -> ExitCode {
     if input.get("tool_name").and_then(Value::as_str) != Some("Bash") {
-        return super::pre_tool_use(input, cwd);
+        return super::pre_tool_use(input, cwd, log);
     }
 
     let command = match input.pointer("/tool_input/command").and_then(Value::as_str) {
@@ -407,10 +415,10 @@ pub(super) fn pre_tool_use(input: &Value, cwd: &Path) -> ExitCode {
             push_unique(&mut skills, (skill_label(&skill), skill));
         }
     }
-    check_skills(skills, deny_tool)
+    check_skills(skills, deny_tool, log)
 }
 
-pub(super) fn user_prompt_submit(input: &Value, cwd: &Path) -> ExitCode {
+pub(super) fn user_prompt_submit(input: &Value, cwd: &Path, log: &mut Log) -> ExitCode {
     let prompt = match input.get("prompt").and_then(Value::as_str) {
         Some(prompt) => prompt,
         None => return ExitCode::SUCCESS,
@@ -445,10 +453,10 @@ pub(super) fn user_prompt_submit(input: &Value, cwd: &Path) -> ExitCode {
             push_unique(&mut skills, found);
         }
     }
-    check_skills(skills, block_prompt)
+    check_skills(skills, block_prompt, log)
 }
 
-pub(super) fn session_start(cwd: &Path) -> ExitCode {
+pub(super) fn session_start(cwd: &Path, log: &mut Log) -> ExitCode {
     let mut targets = agents_files(cwd, &codex_home());
 
     targets.extend(skill_roots(cwd).into_iter().filter(|r| r.is_dir()));
@@ -462,17 +470,24 @@ pub(super) fn session_start(cwd: &Path) -> ExitCode {
         .collect();
     let results = match verify_tree(&targets, &VerifyOptions::default()) {
         Ok(r) => r,
-        Err(_) => return ExitCode::SUCCESS, // verifier error: never blocks session start
+        // verifier error: never blocks session start
+        Err(e) => {
+            log.error("", None, format!("verifier error: {e}"), Decision::Allow);
+            return ExitCode::SUCCESS;
+        }
     };
+    let failed = results.iter().any(|r| r.action == Action::Fail);
+    let strict = failed && strict();
 
-    if !results.iter().any(|r| r.action == Action::Fail) {
+    log_session(log, &results, strict);
+    if !failed {
         return ExitCode::SUCCESS;
     }
 
     let report = format_tree_report(&results, true, false);
     let report = report.trim();
 
-    if strict() {
+    if strict {
         let stop = serde_json::json!({
             "continue": false,
             "stopReason": format!("PromptSign: instruction files failed signature verification:\n{report}"),

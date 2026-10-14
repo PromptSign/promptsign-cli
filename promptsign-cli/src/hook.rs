@@ -16,6 +16,9 @@
 // Codex loads instructions differently and is handled in hook/codex.rs,
 // selected by `--codex` or by the turn_id only Codex sends.
 //
+// `--decision-log <file>` appends a record of every verification to that
+// file, beside any decision log the policies turn on (spec/08).
+//
 // Config via env:
 //   PROMPTSIGN_SKILL_ROOTS — extra skill roots, path-delimiter separated
 //   PROMPTSIGN_STRICT=1    — fail closed: unknown/unresolvable skills are
@@ -26,11 +29,12 @@
 use crate::{format_result, format_tree_report};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use promptsign_core::canonicalize::is_markdown;
+use promptsign_core::decision_log::{self, Context, Decision, Record};
 use promptsign_core::manifest::{role_for, walk_tree, Manifest, CONTEXT_INJECTED};
 use promptsign_core::oms;
 use promptsign_core::policy::{Action, Finding};
 use promptsign_core::util::home_dir;
-use promptsign_core::verify::{verify_target, VerifyOptions};
+use promptsign_core::verify::{verify_target, VerifyOptions, VerifyResult};
 use promptsign_core::verifytree::verify_tree;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -44,6 +48,43 @@ const PATH_DELIMITER: char = if cfg!(windows) { ';' } else { ':' };
 
 fn strict() -> bool {
     promptsign_core::policy::strict_mode()
+}
+
+/// The decision log records of one hook run (spec/08).
+struct Log {
+    ctx: Context,
+    records: Vec<Record>,
+}
+
+impl Log {
+    fn verified(&mut self, r: &VerifyResult, decision: Decision) {
+        self.records
+            .push(Record::verified(&self.ctx, r, Some(decision)));
+    }
+
+    fn unresolved(&mut self, name: &str, message: String, decision: Decision) {
+        self.records
+            .push(Record::unresolved(&self.ctx, name, message, decision));
+    }
+
+    fn error(&mut self, name: &str, target: Option<&str>, message: String, decision: Decision) {
+        self.records.push(Record::error(
+            &self.ctx,
+            name,
+            target,
+            message,
+            Some(decision),
+        ));
+    }
+}
+
+/// `allow`, or `block` when `blocked`.
+fn decision(blocked: bool) -> Decision {
+    if blocked {
+        Decision::Block
+    } else {
+        Decision::Allow
+    }
 }
 
 fn read_stdin_json() -> Value {
@@ -408,7 +449,27 @@ fn escalate(action: &mut Action, level: &str) {
     }
 }
 
+/// The `--decision-log` file and the remaining arguments. The hook ignores
+/// flags it does not know, so a stray one never fails it.
+fn split_log_flag(rest: &[String]) -> (Option<PathBuf>, Vec<String>) {
+    let mut file = None;
+    let mut others = Vec::new();
+    let mut args = rest.iter();
+
+    while let Some(a) = args.next() {
+        if a == "--decision-log" {
+            file = args.next().map(PathBuf::from);
+        } else if let Some(v) = a.strip_prefix("--decision-log=") {
+            file = Some(PathBuf::from(v));
+        } else {
+            others.push(a.clone());
+        }
+    }
+    (file, others)
+}
+
 pub fn cmd_hook(rest: &[String]) -> ExitCode {
+    let (log_file, rest) = split_log_flag(rest);
     let input = read_stdin_json();
     // Only Codex sends turn_id. Its SessionStart event carries nothing that
     // tells it apart from Claude Code's, hence the flag.
@@ -426,15 +487,30 @@ pub fn cmd_hook(rest: &[String]) -> ExitCode {
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
 
-    match event.as_deref() {
-        Some("PreToolUse") if codex => codex::pre_tool_use(&input, &project_dir),
-        Some("UserPromptSubmit") if codex => codex::user_prompt_submit(&input, &project_dir),
-        Some("SessionStart") if codex => codex::session_start(&project_dir),
-        Some("PreToolUse") => pre_tool_use(&input, &project_dir),
-        Some("SessionStart") => session_start(&project_dir),
-        Some("openclaw-install-policy") => openclaw_install_policy(&input),
+    let (harness, logged_event) = match event.as_deref() {
+        Some("openclaw-install-policy") => ("openclaw", "install-policy".to_string()),
+        Some(e) if codex => ("codex", e.to_string()),
+        Some(e) => ("claude", e.to_string()),
+        None => ("claude", String::new()),
+    };
+    let mut log = Log {
+        ctx: crate::log_context(Some(harness), &logged_event),
+        records: Vec::new(),
+    };
+    let code = match event.as_deref() {
+        Some("PreToolUse") if codex => codex::pre_tool_use(&input, &project_dir, &mut log),
+        Some("UserPromptSubmit") if codex => {
+            codex::user_prompt_submit(&input, &project_dir, &mut log)
+        }
+        Some("SessionStart") if codex => codex::session_start(&project_dir, &mut log),
+        Some("PreToolUse") => pre_tool_use(&input, &project_dir, &mut log),
+        Some("SessionStart") => session_start(&project_dir, &mut log),
+        Some("openclaw-install-policy") => openclaw_install_policy(&input, &mut log),
         _ => ExitCode::SUCCESS,
-    }
+    };
+
+    crate::log_decisions(None, log_file.as_deref(), &log.records);
+    code
 }
 
 /// OpenClaw `security.installPolicy` adapter: OpenClaw pipes an install-policy
@@ -444,7 +520,7 @@ pub fn cmd_hook(rest: &[String]) -> ExitCode {
 /// `fail` blocks; `pass`/`warn` allow — make unsigned skills a block by giving
 /// the policy an `enforce` rule (OpenClaw scrubs the child env; pass
 /// PROMPTSIGN_HOME through `security.installPolicy.exec.env`).
-fn openclaw_install_policy(input: &Value) -> ExitCode {
+fn openclaw_install_policy(input: &Value, log: &mut Log) -> ExitCode {
     fn respond(decision: &str, reason: Option<String>, findings: Vec<Value>) -> ExitCode {
         let mut out = serde_json::json!({ "protocolVersion": 1, "decision": decision });
 
@@ -478,8 +554,18 @@ fn openclaw_install_policy(input: &Value) -> ExitCode {
     };
     let r = match verify_target(source_path, &VerifyOptions::default()) {
         Ok(r) => r,
-        Err(e) => return blocked(format!("promptsign: verifier error: {e}"), vec![]),
+        Err(e) => {
+            log.error(
+                source_path,
+                Some(source_path),
+                format!("verifier error: {e}"),
+                Decision::Block,
+            );
+            return blocked(format!("promptsign: verifier error: {e}"), vec![]);
+        }
     };
+
+    log.verified(&r, decision_log::decision_for(r.action));
     let findings: Vec<Value> = r
         .findings
         .iter()
@@ -505,7 +591,7 @@ fn openclaw_install_policy(input: &Value) -> ExitCode {
     respond("allow", None, findings)
 }
 
-fn pre_tool_use(input: &Value, project_dir: &Path) -> ExitCode {
+fn pre_tool_use(input: &Value, project_dir: &Path, log: &mut Log) -> ExitCode {
     if input.get("tool_name").and_then(|v| v.as_str()) != Some("Skill") {
         return ExitCode::SUCCESS;
     }
@@ -525,24 +611,26 @@ fn pre_tool_use(input: &Value, project_dir: &Path) -> ExitCode {
     let skill = match resolve_skill_dir(&skill_name, project_dir) {
         Some(s) => s,
         None => {
-            if strict() {
-                return block(&format!(
-                    "could not locate skill \"{skill_name}\" on disk to verify it (strict mode)"
-                ));
+            let strict = strict();
+            let message = format!("could not locate skill \"{skill_name}\" on disk to verify it");
+
+            log.unresolved(&skill_name, message.clone(), decision(strict));
+            if strict {
+                return block(&format!("{message} (strict mode)"));
             }
             return ExitCode::SUCCESS;
         }
     };
 
-    match skill_failure(&skill_name, &skill) {
+    match skill_failure(&skill_name, &skill, log) {
         Some(reason) => block(&reason),
         None => ExitCode::SUCCESS,
     }
 }
 
-/// Verifies a located skill through the signature that covers it. Returns the
-/// reason to block with, or None when the skill may run.
-fn skill_failure(skill_name: &str, skill: &SkillDir) -> Option<String> {
+/// Verifies a located skill through the signature that covers it and logs the
+/// verdict. Returns the reason to block with, or None when the skill may run.
+fn skill_failure(skill_name: &str, skill: &SkillDir, log: &mut Log) -> Option<String> {
     let root = bundle_root(skill);
     let verdict = verify_target(&root.to_string_lossy(), &VerifyOptions::default()).map(|mut r| {
         // A finding the core already made has already set the action.
@@ -562,18 +650,38 @@ fn skill_failure(skill_name: &str, skill: &SkillDir) -> Option<String> {
     };
 
     match verdict {
-        Ok(r) if r.action == Action::Fail => Some(format!(
-            "signature verification FAILED for skill \"{skill_name}\" at {}{signed_as} — blocking execution.\n{}",
-            skill.dir.display(),
-            format_result(&r, false).trim()
-        )),
-        Ok(_) => None,
+        Ok(r) => {
+            log.verified(&r, decision_log::decision_for(r.action));
+            (r.action == Action::Fail).then(|| format!(
+                "signature verification FAILED for skill \"{skill_name}\" at {}{signed_as} — blocking execution.\n{}",
+                skill.dir.display(),
+                format_result(&r, false).trim()
+            ))
+        }
         // verifier itself broke: fail closed only in strict mode
-        Err(e) => strict().then(|| format!("verifier error for \"{skill_name}\": {e}")),
+        Err(e) => {
+            let strict = strict();
+
+            log.error(
+                skill_name,
+                Some(&root.to_string_lossy()),
+                format!("verifier error: {e}"),
+                decision(strict),
+            );
+            strict.then(|| format!("verifier error for \"{skill_name}\": {e}"))
+        }
     }
 }
 
-fn session_start(project_dir: &Path) -> ExitCode {
+/// Logs every result of a SessionStart verification under one decision: the
+/// session goes on, or it stops.
+fn log_session(log: &mut Log, results: &[VerifyResult], blocked: bool) {
+    for r in results {
+        log.verified(r, decision(blocked));
+    }
+}
+
+fn session_start(project_dir: &Path, log: &mut Log) -> ExitCode {
     let roots: Vec<String> = [
         project_dir.join(".claude"),
         project_dir.join("CLAUDE.md"),
@@ -591,14 +699,21 @@ fn session_start(project_dir: &Path) -> ExitCode {
 
     let results = match verify_tree(&roots, &VerifyOptions::default()) {
         Ok(r) => r,
-        Err(_) => return ExitCode::SUCCESS, // verifier error: never blocks session start
+        // verifier error: never blocks session start
+        Err(e) => {
+            log.error("", None, format!("verifier error: {e}"), Decision::Allow);
+            return ExitCode::SUCCESS;
+        }
     };
+    let failed = results.iter().any(|r| r.action == Action::Fail);
+    let strict = failed && strict();
 
-    if results.iter().any(|r| r.action == Action::Fail) {
+    log_session(log, &results, strict);
+    if failed {
         let report = format_tree_report(&results, true, false);
         let report = report.trim();
 
-        if strict() {
+        if strict {
             return block(&format!(
                 "instruction files failed signature verification:\n{report}"
             ));

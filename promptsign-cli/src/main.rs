@@ -15,6 +15,7 @@ mod tuf;
 
 #[cfg(feature = "local-key")]
 use promptsign_core::bundle::{sign_manifest, write_bundle};
+use promptsign_core::decision_log::{self, Context, Record};
 #[cfg(feature = "local-key")]
 use promptsign_core::keys::{default_identity, default_key_path, keygen, load_private_key};
 use promptsign_core::manifest::{build_manifest, BuildOptions};
@@ -39,8 +40,8 @@ const USAGE: &str = "promptsign VERSION — identity-verified signing for AI ins
 Usage:
   promptsign login [--print-token]   (interactive browser sign-in; caches a token for signing)
   promptsign sign <dir|file> [--identity-token <jwt>] [--embed] [--name n] [--version v] [--kind k]
-  promptsign verify <dir|file> [--policy path] [--json] [--no-pin-updates]
-  promptsign verify-tree <root>... [--policy path] [--json] [--quiet] [--no-pin-updates]
+  promptsign verify <dir|file> [--policy path] [--json] [--no-pin-updates] [--decision-log file]
+  promptsign verify-tree <root>... [--policy path] [--json] [--quiet] [--no-pin-updates] [--decision-log file]
   promptsign policy init [--global] | policy show  (the machine's managed policy, yours, and the project's)
   promptsign pin list | pin rm <name>
   promptsign trust fetch [--force] [--managed] [<bundle>] | trust show   (refresh Sigstore roots and trust bundles)
@@ -49,7 +50,7 @@ Usage:
   promptsign trust list | trust rm <name> [--managed]   (roots a signature may chain to)
   promptsign revoke fetch [--managed] | revoke show  (refresh/inspect the cached revocation feed)
   promptsign revoke sign <entries.json> [--out path]   (publish a signed revocation feed)
-  promptsign hook [event] [--codex]   (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
+  promptsign hook [event] [--codex] [--decision-log file]   (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
   promptsign proxy [--host h] [--port p] [--allow-origin o] [--allow-host h]
                               (local CORS proxy for in-browser keyless signing)
 
@@ -76,8 +77,8 @@ Usage:
   promptsign sign <dir|file> [--identity-token <jwt>] [--embed] [--name n] [--version v] [--kind k]
   promptsign sign <dir|file> --local-key [--identity id] [--key path] [--embed] [--name n] [--version v] [--kind k]
   promptsign keygen [--identity <id>] [--force]
-  promptsign verify <dir|file> [--policy path] [--json] [--no-pin-updates]
-  promptsign verify-tree <root>... [--policy path] [--json] [--quiet] [--no-pin-updates]
+  promptsign verify <dir|file> [--policy path] [--json] [--no-pin-updates] [--decision-log file]
+  promptsign verify-tree <root>... [--policy path] [--json] [--quiet] [--no-pin-updates] [--decision-log file]
   promptsign policy init [--global] | policy show  (the machine's managed policy, yours, and the project's)
   promptsign pin list | pin rm <name>
   promptsign trust fetch [--force] [--managed] [<bundle>] | trust show   (cache Sigstore roots for offline verify)
@@ -86,7 +87,7 @@ Usage:
   promptsign trust list | trust rm <name> [--managed]   (roots a signature may chain to)
   promptsign revoke fetch [--managed] | revoke show  (refresh/inspect the cached revocation feed)
   promptsign revoke sign <entries.json> [--out path]   (publish a signed revocation feed)
-  promptsign hook [event] [--codex]   (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
+  promptsign hook [event] [--codex] [--decision-log file]   (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
   promptsign proxy [--host h] [--port p] [--allow-origin o] [--allow-host h]
                               (local CORS proxy for in-browser keyless signing)
 
@@ -118,6 +119,38 @@ fn usage() -> String {
 fn fail(msg: &str) -> ! {
     eprintln!("promptsign: {msg}");
     std::process::exit(1);
+}
+
+/// Where decision log records come from (spec/08).
+fn log_context(harness: Option<&str>, event: &str) -> Context {
+    Context {
+        verifier: format!("promptsign-cli/{VERSION}"),
+        harness: harness.map(str::to_string),
+        event: event.to_string(),
+    }
+}
+
+/// Appends records to the decision logs the policies turn on and to `file`.
+/// A failed write prints a warning and changes nothing else.
+fn log_decisions(policy: Option<&Path>, file: Option<&Path>, records: &[Record]) {
+    for e in decision_log::append(&decision_log::sinks(policy, file), records) {
+        eprintln!("promptsign: {e}");
+    }
+}
+
+/// Logs a verification error, then fails like [`fail`].
+fn fail_logged(
+    policy: Option<&Path>,
+    file: Option<&Path>,
+    event: &str,
+    target: Option<&str>,
+    msg: &str,
+) -> ! {
+    let ctx = log_context(None, event);
+    let record = Record::error(&ctx, target.unwrap_or(""), target, msg.to_string(), None);
+
+    log_decisions(policy, file, &[record]);
+    fail(msg)
 }
 
 // ANSI color helpers. Colorizing is opt-in per call (see `use_color`) so the
@@ -797,12 +830,18 @@ fn cmd_revoke(rest: &[String]) -> ExitCode {
 }
 
 fn cmd_verify(rest: &[String]) -> ExitCode {
-    let p =
-        args::parse(rest, &["policy"], &["json", "no-pin-updates"]).unwrap_or_else(|e| fail(&e));
+    let p = args::parse(
+        rest,
+        &["policy", "decision-log"],
+        &["json", "no-pin-updates"],
+    )
+    .unwrap_or_else(|e| fail(&e));
     let target = p
         .positionals
         .first()
         .unwrap_or_else(|| fail("verify: missing <dir|file>"));
+    let policy = p.values.get("policy").map(PathBuf::from);
+    let log_file = p.values.get("decision-log").map(PathBuf::from);
 
     if !Path::new(target).exists() {
         fail(&format!("verify: no such path: {target}"));
@@ -811,12 +850,26 @@ fn cmd_verify(rest: &[String]) -> ExitCode {
     let r = verify_target(
         target,
         &VerifyOptions {
-            policy_path: p.values.get("policy").map(PathBuf::from),
+            policy_path: policy.clone(),
             no_pin_updates: p.flags.contains("no-pin-updates"),
             skip_policy: false,
         },
     )
-    .unwrap_or_else(|e| fail(&e));
+    .unwrap_or_else(|e| {
+        fail_logged(
+            policy.as_deref(),
+            log_file.as_deref(),
+            "verify",
+            Some(target),
+            &e,
+        )
+    });
+
+    log_decisions(
+        policy.as_deref(),
+        log_file.as_deref(),
+        &[Record::verified(&log_context(None, "verify"), &r, None)],
+    );
 
     if p.flags.contains("json") {
         println!("{}", serde_json::to_string_pretty(&r).unwrap());
@@ -827,8 +880,14 @@ fn cmd_verify(rest: &[String]) -> ExitCode {
 }
 
 fn cmd_verify_tree(rest: &[String]) -> ExitCode {
-    let p = args::parse(rest, &["policy"], &["json", "quiet", "no-pin-updates"])
-        .unwrap_or_else(|e| fail(&e));
+    let p = args::parse(
+        rest,
+        &["policy", "decision-log"],
+        &["json", "quiet", "no-pin-updates"],
+    )
+    .unwrap_or_else(|e| fail(&e));
+    let policy = p.values.get("policy").map(PathBuf::from);
+    let log_file = p.values.get("decision-log").map(PathBuf::from);
 
     if p.positionals.is_empty() {
         fail("verify-tree: missing <root>...");
@@ -837,12 +896,27 @@ fn cmd_verify_tree(rest: &[String]) -> ExitCode {
     let results = verify_tree(
         &p.positionals,
         &VerifyOptions {
-            policy_path: p.values.get("policy").map(PathBuf::from),
+            policy_path: policy.clone(),
             no_pin_updates: p.flags.contains("no-pin-updates"),
             skip_policy: false,
         },
     )
-    .unwrap_or_else(|e| fail(&e));
+    .unwrap_or_else(|e| {
+        fail_logged(
+            policy.as_deref(),
+            log_file.as_deref(),
+            "verify-tree",
+            None,
+            &e,
+        )
+    });
+    let ctx = log_context(None, "verify-tree");
+    let records: Vec<Record> = results
+        .iter()
+        .map(|r| Record::verified(&ctx, r, None))
+        .collect();
+
+    log_decisions(policy.as_deref(), log_file.as_deref(), &records);
 
     if p.flags.contains("json") {
         println!("{}", serde_json::to_string_pretty(&results).unwrap());
@@ -1067,6 +1141,7 @@ mod report_tests {
             signed: true,
             action: Action::Fail,
             findings,
+            evidence: Default::default(),
         }
     }
 

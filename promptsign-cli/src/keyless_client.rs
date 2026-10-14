@@ -9,7 +9,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use promptsign_core::bundle::{pae, BUNDLE_SCHEMA};
 use promptsign_core::keyless::{chain_leaf_info, pem_chain_to_b64_der, trust_dir, trusted_log_ids};
 use promptsign_core::revocation::{
-    feed_path, load_cached_feed, verify_feed, RevocationEntry, RevocationFeed,
+    feed_path, feed_pin, load_cached_feed, verify_feed, RevocationEntry, RevocationFeed,
     REVOCATION_PAYLOAD_TYPE, REVOCATION_SCHEMA,
 };
 use promptsign_core::util::{hex, iso8601_now};
@@ -693,16 +693,28 @@ fn load_active_policy() -> Result<promptsign_core::policy::Policy> {
     Ok(eff.revocation().unwrap_or(eff.base()).clone())
 }
 
-/// Opportunistic online refresh: fetch the policy's `revocation_feed`, verify it
-/// against the pinned feed identity, and cache it for offline verification. This
-/// is the only online step in the revocation path. `managed` writes the
-/// managed copy, which every user on the machine reads.
+/// Opportunistic online refresh: fetch the policy's `revocation_feed` (or the
+/// feed an installed trust bundle names), verify it against the pinned feed
+/// signer and root, and cache it for offline verification. This is the only
+/// online step in the revocation path. `managed` writes the managed copy,
+/// which every user on the machine reads.
 pub fn revoke_fetch(managed: bool) -> Result<()> {
     let policy = load_active_policy()?;
-    let url = policy
-        .revocation_feed
-        .clone()
-        .ok_or("no revocation_feed in policy — add one (see spec/06) before fetching")?;
+
+    if policy.revocation_feed.is_none() {
+        return Err(
+            "no revocation_feed in policy — add one (see spec/06) before fetching".to_string(),
+        );
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let registry = promptsign_core::trustroot::load_full_registry(now)?;
+    let url = feed_pin(&policy, &registry)?
+        .url
+        .ok_or("no revocation_feed in policy")?;
     let bundle: Value = agent()
         .get(&url)
         .call()
