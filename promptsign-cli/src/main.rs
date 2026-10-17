@@ -50,6 +50,8 @@ Usage:
   promptsign trust list | trust rm <name> [--managed]   (roots a signature may chain to)
   promptsign revoke fetch [--managed] | revoke show  (refresh/inspect the cached revocation feed)
   promptsign revoke sign <entries.json> [--out path]   (publish a signed revocation feed)
+  promptsign approve <dir|file> [--note text] [--store | --out path] [--identity-token <jwt>]
+                              (sign an approval of these exact bytes; --listing prints what it covers)
   promptsign hook [event] [--codex] [--decision-log file]   (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
   promptsign proxy [--host h] [--port p] [--allow-origin o] [--allow-host h]
                               (local CORS proxy for in-browser keyless signing)
@@ -87,6 +89,8 @@ Usage:
   promptsign trust list | trust rm <name> [--managed]   (roots a signature may chain to)
   promptsign revoke fetch [--managed] | revoke show  (refresh/inspect the cached revocation feed)
   promptsign revoke sign <entries.json> [--out path]   (publish a signed revocation feed)
+  promptsign approve <dir|file> [--note text] [--store | --out path] [--identity-token <jwt>]
+                              (sign an approval of these exact bytes; --listing prints what it covers)
   promptsign hook [event] [--codex] [--decision-log file]   (Claude Code / Codex / OpenClaw hook: reads event JSON on stdin)
   promptsign proxy [--host h] [--port p] [--allow-origin o] [--allow-host h]
                               (local CORS proxy for in-browser keyless signing)
@@ -206,7 +210,8 @@ fn harness_note(rel_path: &str) -> Option<&'static str> {
 }
 
 pub fn format_result(r: &VerifyResult, color: bool) -> String {
-    let (label, codes) = if r.signed {
+    // An unsigned artifact that its approvals let through gets a verdict.
+    let (label, codes) = if r.signed || !r.approvals.is_empty() {
         match r.action {
             Action::Pass => ("[ OK ]", concat!("\x1b[1m", "\x1b[32m")),
             Action::Warn => ("[WARN]", concat!("\x1b[1m", "\x1b[33m")),
@@ -246,6 +251,18 @@ pub fn format_result(r: &VerifyResult, color: bool) -> String {
     };
     let target = paint(&r.target, color::DIM, color);
     let mut out = format!("{icon} {}{version}{who}{tags} — {target}\n", r.name);
+
+    if !r.approvals.is_empty() {
+        let by: Vec<String> = r
+            .approvals
+            .iter()
+            .map(|a| match a.root.as_str() {
+                trustroot::DEFAULT_ROOT => a.identity.clone(),
+                root => format!("{} (root {root})", a.identity),
+            })
+            .collect();
+        let _ = writeln!(out, "       approved by {}", by.join(", "));
+    }
 
     for f in &r.findings {
         let codes = match f.level.as_str() {
@@ -797,6 +814,35 @@ fn cmd_trust_list() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn cmd_approve(rest: &[String]) -> ExitCode {
+    let p = args::parse(
+        rest,
+        &["note", "out", "identity-token"],
+        &["store", "listing"],
+    )
+    .unwrap_or_else(|e| fail(&e));
+    let target = p
+        .positionals
+        .first()
+        .unwrap_or_else(|| fail("approve: missing <dir|file>"));
+    let out = match (p.values.get("out"), p.flags.contains("store")) {
+        (Some(_), true) => fail("approve: --out and --store are exclusive"),
+        (Some(f), false) => keyless_client::ApprovalOut::File(f),
+        (None, true) => keyless_client::ApprovalOut::Store,
+        (None, false) => keyless_client::ApprovalOut::Beside,
+    };
+
+    keyless_client::approve(
+        target,
+        p.values.get("note").map(String::as_str),
+        out,
+        p.flags.contains("listing"),
+        p.values.get("identity-token").map(String::as_str),
+    )
+    .map(|_| ExitCode::SUCCESS)
+    .unwrap_or_else(|e| fail(&e))
+}
+
 fn cmd_revoke(rest: &[String]) -> ExitCode {
     match rest.first().map(String::as_str) {
         Some("fetch") => {
@@ -1097,6 +1143,7 @@ fn main() -> ExitCode {
         "pin" => cmd_pin(rest),
         "trust" => cmd_trust(rest),
         "revoke" => cmd_revoke(rest),
+        "approve" => cmd_approve(rest),
         "hook" => hook::cmd_hook(rest),
         "proxy" => proxy::cmd_proxy(rest),
         "version" | "--version" | "-v" => {
@@ -1141,8 +1188,34 @@ mod report_tests {
             signed: true,
             action: Action::Fail,
             findings,
+            approvals: Vec::new(),
             evidence: Default::default(),
         }
+    }
+
+    #[test]
+    fn an_approved_unsigned_artifact_names_its_approvers() {
+        let approval = |identity: &str, root: &str| promptsign_core::approval::Approval {
+            identity: identity.to_string(),
+            issuer: "https://sso.acme.test".to_string(),
+            root: root.to_string(),
+            signed_at: None,
+            payload_digest: String::new(),
+            log_index: None,
+        };
+        let r = VerifyResult {
+            signed: false,
+            action: Action::Pass,
+            approvals: vec![
+                approval("alice@acme.test", "acme/prod"),
+                approval("bob@acme.test", trustroot::DEFAULT_ROOT),
+            ],
+            ..failing_result(Vec::new())
+        };
+        let out = format_result(&r, false);
+
+        assert!(out.starts_with("[ OK ] promptsign (unsigned)"), "{out}");
+        assert!(out.contains("approved by alice@acme.test (root acme/prod), bob@acme.test\n"));
     }
 
     #[test]

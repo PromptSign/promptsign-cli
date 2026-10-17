@@ -301,6 +301,22 @@ A bundle can also name the organization's revocation feed (spec/06). With
 downloads the feed the bundle names. The feed may chain to any root you trust,
 including the organization's own Fulcio or a CA with no transparency log.
 
+A policy can also require reviewers' approvals of the exact bytes (spec/09).
+`promptsign approve <dir|file>` signs one as you and writes it to the
+artifact's `.promptsign/approvals/`, or to your own store with `--store`. A
+rule such as
+
+```json
+{ "pattern": "*", "action": "enforce",
+  "approval": { "approvers": [{ "identity": "*@acme.example", "trust_root": "acme/*" }],
+                "threshold": 2 } }
+```
+
+then needs two approvers' approvals of the content on disk. A rule that names
+no author accepts an unsigned artifact once it has them, and the revocation
+feed withdraws an approval as it does a signature. `approve --listing` prints
+the content an approval covers, for signing it with another tool.
+
 Keep the `.psig.json` sidecar next to the archive under its original name; that
 pairing is how `verify` finds it. Bare `promptsign verify` pins the signer on
 first use (TOFU) and holds across releases, since archive names carry the

@@ -841,6 +841,108 @@ pub fn revoke_sign(
     Ok(())
 }
 
+/// What `approve` writes the approval to: `--out`, the user's store with
+/// `--store`, else the artifact's own `.promptsign/approvals/`.
+pub enum ApprovalOut<'a> {
+    File(&'a str),
+    Store,
+    Beside,
+}
+
+/// Approver tool (spec/09): sign an approval of the artifact's exact content
+/// as the signed-in identity. With `listing`, print the content listing
+/// instead, for attesting it with another tool.
+pub fn approve(
+    target: &str,
+    note: Option<&str>,
+    out: ApprovalOut,
+    listing: bool,
+    token_flag: Option<&str>,
+) -> Result<()> {
+    use promptsign_core::approval::{
+        listing_of, local_dir, manifest_for, statement, user_store, verify_approval,
+        IN_TOTO_PAYLOAD_TYPE,
+    };
+
+    let path = std::path::Path::new(target);
+    let manifest = manifest_for(path)?;
+    let content = listing_of(&manifest.files);
+
+    if listing {
+        print!("{}", content.text);
+        return Ok(());
+    }
+
+    require_keyless_root()?;
+
+    let payload = serde_json::to_vec(&statement(
+        &manifest.name,
+        &content.digest,
+        &iso8601_now(),
+        note,
+    ))
+    .map_err(|e| e.to_string())?;
+    let outcome = keyless_sign(&payload, IN_TOTO_PAYLOAD_TYPE, token_flag)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+
+    // The approval must verify offline and cover this content before we write
+    // it anywhere a verifier reads.
+    verify_approval(
+        &outcome.bundle,
+        &content.digest,
+        &promptsign_core::trustroot::load_full_registry(now)?.roots,
+        now,
+    )
+    .map_err(|e| format!("self-verification of the signed approval failed: {e:?}"))?;
+
+    let file_name = format!(
+        "{}-{now}.json",
+        outcome
+            .identity
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || "@.-_".contains(c) {
+                c
+            } else {
+                '_'
+            })
+            .collect::<String>()
+    );
+    let dest = match out {
+        ApprovalOut::File(f) => std::path::PathBuf::from(f),
+        ApprovalOut::Store => user_store(&content.digest).join(file_name),
+        ApprovalOut::Beside => {
+            let abs = std::path::absolute(path).map_err(|e| format!("{target}: {e}"))?;
+
+            local_dir(&abs, abs.is_dir())
+                .ok_or_else(|| format!("{target}: no directory to put the approval in"))?
+                .join(file_name)
+        }
+    };
+
+    if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+
+    let json = serde_json::to_string_pretty(&outcome.bundle).map_err(|e| e.to_string())?;
+
+    std::fs::write(&dest, json + "\n").map_err(|e| format!("{}: {e}", dest.display()))?;
+    println!(
+        "approved \"{}\" ({} file{}, content sha256:{}) as {} via {}",
+        manifest.name,
+        content.files,
+        if content.files == 1 { "" } else { "s" },
+        content.digest,
+        outcome.identity,
+        outcome.issuer
+    );
+    println!("approval: {}", dest.display());
+    println!("transparency log index: {}", outcome.log_index);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ensure_no_loss, pem_block_ders};
